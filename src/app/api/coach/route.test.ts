@@ -90,8 +90,13 @@ describe("POST /api/coach", () => {
       text: JSON.stringify({
         mode: "learner_improve",
         user_sentence: "오늘 김치 먹었어요",
+        heard_as_ko: "오늘 김치 먹었어요",
+        meant_en: "I ate kimchi today.",
         natural_ko: "오늘 김치를 먹었어요.",
-        tip_en: "Add object particle 를.",
+        natural_en: "I ate kimchi today.",
+        formality: "haeyo",
+        formality_fit: "fits",
+        tips_en: ["Mark the object: 김치를."],
         was_already_natural: false,
       }),
     });
@@ -173,7 +178,7 @@ describe("POST /api/coach", () => {
     expect(mockGenerateContent).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects when GOOGLE_CLOUD_PROJECT missing", async () => {
+  it("rejects when GOOGLE_CLOUD_PROJECT missing without leaking infra", async () => {
     const { POST } = await import("@/app/api/coach/route");
     const res = await POST(
       new Request("http://localhost/api/coach", {
@@ -187,6 +192,8 @@ describe("POST /api/coach", () => {
       }),
     );
     expect(res.status).toBe(500);
+    const json = await res.json();
+    expect(json.message).not.toMatch(/GOOGLE_CLOUD|ADC|Vertex/i);
   });
 
   it("forbids polish at advanced level", async () => {

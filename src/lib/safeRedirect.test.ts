@@ -4,7 +4,9 @@ import { safeInternalPath } from "@/lib/safeRedirect";
 describe("safeInternalPath", () => {
   it("allows normal internal paths", () => {
     expect(safeInternalPath("/session")).toBe("/session");
-    expect(safeInternalPath("/history?tab=1")).toBe("/history?tab=1");
+    expect(safeInternalPath("/session?scenario=cafe")).toBe(
+      "/session?scenario=cafe",
+    );
   });
 
   it("rejects protocol-relative and absolute URLs", () => {
