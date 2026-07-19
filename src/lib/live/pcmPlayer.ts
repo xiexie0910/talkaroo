@@ -12,6 +12,10 @@ export type PcmPlayer = {
   playBase64: (base64: string) => Promise<void>;
   flush: () => void;
   dispose: () => void;
+  /** True while speaker audio is queued or actively playing. */
+  isBusy: () => boolean;
+  /** Approx ms until the playback queue drains (0 if idle). */
+  queuedMsRemaining: () => number;
 };
 
 export function createPcmPlayer(): PcmPlayer {
@@ -19,6 +23,13 @@ export function createPcmPlayer(): PcmPlayer {
   let nextPlayTime = 0;
   let epoch = 0;
   let active: AudioBufferSourceNode[] = [];
+
+  const queuedMsRemaining = () => {
+    if (!ctx) return 0;
+    return Math.max(0, (nextPlayTime - ctx.currentTime) * 1000);
+  };
+
+  const isBusy = () => active.length > 0 || queuedMsRemaining() > 40;
 
   const flush = () => {
     epoch += 1;
@@ -63,5 +74,5 @@ export function createPcmPlayer(): PcmPlayer {
     nextPlayTime = startAt + buffer.duration;
   };
 
-  return { playBase64, flush, dispose };
+  return { playBase64, flush, dispose, isBusy, queuedMsRemaining };
 }

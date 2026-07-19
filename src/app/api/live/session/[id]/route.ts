@@ -86,6 +86,8 @@ export async function GET(req: Request, { params }: Params) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      // Prevent proxies (and some Next runtimes) from buffering SSE captions.
+      "X-Accel-Buffering": "no",
     },
   });
 }

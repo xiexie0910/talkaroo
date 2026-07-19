@@ -22,6 +22,26 @@ const SILENCE_DURATION_MS = (() => {
   return Math.min(2000, Math.max(200, raw));
 })();
 
+/**
+ * Required speech duration before start-of-speech is committed.
+ * Higher = fewer false starts from clicks / room noise.
+ * Keep moderate so quiet speech and short replies ("네") still work.
+ */
+const PREFIX_PADDING_MS = (() => {
+  const raw = Number(process.env.GEMINI_LIVE_PREFIX_PADDING_MS?.trim() || "160");
+  if (!Number.isFinite(raw)) return 160;
+  return Math.min(1000, Math.max(20, raw));
+})();
+
+/**
+ * LOW = fewer ambient false starts (default).
+ * Set GEMINI_LIVE_START_SENSITIVITY=high if quiet speech is missed.
+ */
+const START_OF_SPEECH =
+  process.env.GEMINI_LIVE_START_SENSITIVITY?.trim().toLowerCase() === "high"
+    ? StartSensitivity.START_SENSITIVITY_HIGH
+    : StartSensitivity.START_SENSITIVITY_LOW;
+
 /** Idle Live sockets are closed so abandoned tabs don't burn Vertex quota. */
 const SESSION_TTL_MS = 30 * 60_000;
 /** Soft cap per user on one Node process (multi-tab / reconnect storms). */
@@ -141,13 +161,13 @@ export async function createLiveBridgeSession(
       outputAudioTranscription: {
         languageHints: { languageCodes: ["ko-KR"] },
       },
-      // Responsive VAD (Gemini Live defaults lean HIGH). Silence window still
-      // gives a short think-pause without waiting the full 2s Vertex max.
+      // LOW start + modest prefixPadding: less click/"음" noise than HIGH/20ms,
+      // without the aggressive client gate that was dropping real speech.
       realtimeInputConfig: {
         automaticActivityDetection: {
-          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+          startOfSpeechSensitivity: START_OF_SPEECH,
           endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-          prefixPaddingMs: 20,
+          prefixPaddingMs: PREFIX_PADDING_MS,
           silenceDurationMs: SILENCE_DURATION_MS,
         },
       },
@@ -180,7 +200,7 @@ export async function createLiveBridgeSession(
             text: sc.outputTranscription.text,
           });
         }
-        // Interim ASR while the learner is still speaking (full snapshot).
+        // Low-latency caption while the learner is still speaking (full snapshot).
         if (sc.interimInputTranscription?.text) {
           emit(stored, {
             type: "input_transcription",
@@ -188,12 +208,13 @@ export async function createLiveBridgeSession(
             mode: "replace",
           });
         }
-        // Committed input transcription chunks (usually deltas).
+        // Input transcription: unfinished = cumulative interim; finished/omitted = delta.
         if (sc.inputTranscription?.text) {
+          const interim = sc.inputTranscription.finished === false;
           emit(stored, {
             type: "input_transcription",
             text: sc.inputTranscription.text,
-            mode: "append",
+            mode: interim ? "replace" : "append",
           });
         }
         if (sc.turnComplete) {
