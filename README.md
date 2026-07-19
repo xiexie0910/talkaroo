@@ -1,67 +1,34 @@
 # Talkaroo
 
-Korean conversation practice with a **dual-channel coach**: Gemini Live (Vertex AI) stays in character for daily small talk, while a separate Gemini grammar coach fills a Learning HUD after each turn.
+Korean conversation practice with a **dual-channel** design:
 
-Built with **Codex + GPT-5.6** as the development agents ([OpenAI Build Week](OPENAI_BUILD_WEEK.md)); the runtime product stack is Google Gemini + **Supabase** (auth + Postgres).
+- **Partner** — Gemini Live (Vertex AI) stays in character across café, restaurant, directions, and daily chat
+- **Coach** — a separate Gemini model fills an on-tap Learning HUD (Understand / Polish by learner level)
 
-## Setup
+Practice a scene → speak Korean → tap **Understand** or **Polish** when you want help → **End & reflect** for a short win, focus phrase, and next mission.
 
-### 1. Google Cloud (Gemini)
+## OpenAI Build Week
 
-```bash
-gcloud auth application-default login
-gcloud auth application-default set-quota-project YOUR_PROJECT_ID
-gcloud config set project YOUR_PROJECT_ID
-```
+| | |
+| --- | --- |
+| **Hackathon** | [OpenAI Build Week](https://openai.devpost.com/) · submission **Jul 13 – Jul 21, 2026, 5:00 PM PT** |
+| **Track** | **Education** |
+| **Runtime** | Gemini Live + Gemini coach/recap (Vertex) · Supabase auth/Postgres |
+| **Build agents** | **Codex** + **GPT-5.6** — used to design and ship the app (not called at runtime) |
+| **Codex Session ID** | _add `/feedback` ID from the primary build thread before submit_ |
 
-Enable the Vertex AI API (`aiplatform.googleapis.com`) on the project.
+**How Codex + GPT-5.6 were used:** dual-channel architecture, session/landing UI, Live bridge, coach & recap APIs, ASR turn-taking, level affordances, and prompt-boundary hardening. Demo voiceover should cover the product plus how Codex and GPT-5.6 accelerated the build. No `OPENAI_API_KEY` in the product.
 
-### 2. Supabase (auth + database)
+## Stack
 
-1. Create a project at [supabase.com](https://supabase.com).
-2. In **SQL Editor**, run the migration in [`supabase/migrations/20260719000000_init.sql`](supabase/migrations/20260719000000_init.sql).
-3. Copy **Project URL** and **publishable** (or anon) key from **Project Settings → API**.
-4. Under **Authentication → URL configuration**, add:
-   - Site URL: `http://localhost:3000`
-   - Redirect URLs: `http://localhost:3000/auth/callback`, `http://localhost:3000/auth/confirm`
+Next.js 16 · React 19 · Supabase · Vertex Gemini (`gemini-live-2.5-flash-native-audio` + `gemini-2.5-flash-lite`) · Zod · Vitest
 
-### 3. App env
-
-```bash
-cp .env.example .env.local
-# set GOOGLE_CLOUD_PROJECT, NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY
-
-npm install
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) → **Sign up / Sign in** → **Start 일상 대화**.
-
-## Architecture
+## How it works
 
 ```
-Mic PCM (16 kHz) → POST /api/live/session/[id]/audio → Gemini Live (server)
-Gemini Live → SSE /api/live/session/[id] → browser playback (24 kHz)
-Final user transcript → POST /api/coach (Gemini) → Learning HUD
-Auth cookie → Supabase Auth  ·  turns/coach → Postgres (RLS)
+Mic → Gemini Live partner (audio + transcripts)
+On-tap → Gemini coach HUD
+End & reflect → short recap + next mission
 ```
 
-- Voice never waits for the coach. Coaching is **on tap by level** (Beginner: Understand + Polish; Intermediate: Understand only; Advanced: none) — nothing auto-fires after each turn.
-- Models (Vertex): Live = `gemini-live-2.5-flash-native-audio`; coach = `gemini-2.5-flash-lite` (fastest structured JSON we measured). Override via `GEMINI_LIVE_MODEL` / `GEMINI_COACH_MODEL`.
-- Vertex ADC credentials stay on the server (no Gemini key in the browser).
-- Live bridge is **in-memory on one Node process** (local/`next start`). Do not horizontally scale `/api/live/*` without sticky sessions or an external Live proxy — SSE/audio will 404 on the wrong instance.
-- Practice sessions, turns, and coach results are stored per user in Supabase with row-level security.
-
-## Scripts
-
-- `npm run dev` — local app
-- `npm test` — Vitest
-- `npm run typecheck` — TypeScript (`tsc --noEmit`)
-- `npm run lint` — ESLint
-- `npm run build` — production build
-
-CI runs lint, typecheck, test, and build on every PR (see `.github/workflows/ci.yml`).
-
-## ASR / turn-taking note
-
-Live sessions bias input transcription to `ko-KR` and use a short silence window (`GEMINI_LIVE_SILENCE_MS`, default **900**) so the partner replies quickly after you finish. Raise it (up to **2000**) if mid-thought pauses get cut off. If ASR still drops particles (은/는, 이/가, 을/를) or mangles Hangul, use the text fallback bar for a clean coach take.
+Coaching is **on tap by level** (Beginner: Understand + Polish; Intermediate: Understand; Advanced: none) — voice never waits on the coach.
