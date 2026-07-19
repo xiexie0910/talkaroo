@@ -1,6 +1,6 @@
 /**
- * Captures mic PCM at 16 kHz and POSTs batched base64 frames to Live audio.
- * Batching cuts request spam vs one fetch per ScriptProcessor callback.
+ * Captures mic PCM at 16 kHz and sends batched base64 frames to Live.
+ * Batching cuts spam vs one send per ScriptProcessor callback.
  * Noise filtering is handled by Live VAD (start sensitivity + prefix padding).
  */
 import {
@@ -9,7 +9,7 @@ import {
   floatTo16BitPCM,
 } from "@/lib/live/audio";
 
-/** Smaller batches = snappier Live ASR; still avoids one fetch per audio callback. */
+/** Smaller batches = snappier Live ASR; still avoids one send per audio callback. */
 const BATCH_MS = 60;
 
 export type MicCapture = {
@@ -17,7 +17,8 @@ export type MicCapture = {
 };
 
 type Options = {
-  sessionId: string;
+  /** Deliver a base64 PCM batch (WebSocket or HTTP POST). */
+  sendAudio: (base64Pcm: string) => void;
   /** Return false to drop frames (session replaced / ended). */
   isActive: () => boolean;
   /**
@@ -28,7 +29,7 @@ type Options = {
 };
 
 export async function startMicCapture(options: Options): Promise<MicCapture> {
-  const { sessionId, isActive, shouldSend } = options;
+  const { sendAudio, isActive, shouldSend } = options;
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
@@ -57,13 +58,11 @@ export async function startMicCapture(options: Options): Promise<MicCapture> {
       merged.set(new Uint8Array(chunk), offset);
       offset += chunk.byteLength;
     }
-    void fetch(`/api/live/session/${sessionId}/audio`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audio: arrayBufferToBase64(merged.buffer) }),
-    }).catch(() => {
+    try {
+      sendAudio(arrayBufferToBase64(merged.buffer));
+    } catch {
       /* session may be closing */
-    });
+    }
   };
 
   const flushPending = () => {

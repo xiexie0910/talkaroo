@@ -3,8 +3,8 @@
 /**
  * Practice session UI + Live voice wiring.
  *
- * Flow: pick scenario/level → Start → mic streams to /api/live →
- * transcripts land in PartnerPane → coach cards attach under turns.
+ * Flow: pick scenario/level → Start → Live over WebSocket (Vercel) or
+ * HTTP+SSE (local) → transcripts in PartnerPane → coach cards on tap.
  *
  * Level only gates on-tap coaching (see lib/session/level.ts),
  * not the partner’s system prompt. No auto coach after turns.
@@ -26,6 +26,10 @@ import {
   type BrowserAsr,
 } from "@/lib/live/browserAsr";
 import { startMicCapture, type MicCapture } from "@/lib/live/micCapture";
+import {
+  openLiveConnection,
+  type LiveConnection,
+} from "@/lib/live/openLiveConnection";
 import { createPcmPlayer, type PcmPlayer } from "@/lib/live/pcmPlayer";
 import type { LiveBridgeEvent } from "@/lib/live/types";
 import type { CompleteSessionResult, SessionRecap } from "@/lib/recap/schema";
@@ -108,10 +112,10 @@ export function SessionClient({
   );
   const [recap, setRecap] = useState<SessionRecap | null>(null);
 
-  // Refs keep latest values inside SSE / audio callbacks without re-subscribing
+  // Refs keep latest values inside Live / audio callbacks without re-subscribing
   const sessionIdRef = useRef<string | null>(null);
   const practiceSessionIdRef = useRef<string | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const liveConnRef = useRef<LiveConnection | null>(null);
   const currentTurnIdRef = useRef<string | null>(null);
   const coachAbortRef = useRef<AbortController | null>(null);
   const lastCoachRef = useRef<LastCoachRequest | null>(null);
@@ -497,10 +501,10 @@ export function SessionClient({
   );
 
   const startMic = useCallback(
-    async (sessionId: string) => {
+    async (sessionId: string, sendAudio: (base64Pcm: string) => void) => {
       stopMic();
       micRef.current = await startMicCapture({
-        sessionId,
+        sendAudio,
         isActive: () => sessionIdRef.current === sessionId,
         // Don't upload speaker bleed while the partner is talking.
         shouldSend: () =>
@@ -538,14 +542,11 @@ export function SessionClient({
     stopMic();
     playerRef.current?.dispose();
     playerRef.current = null;
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
-    const id = sessionIdRef.current;
+    const conn = liveConnRef.current;
+    liveConnRef.current = null;
     sessionIdRef.current = null;
     practiceSessionIdRef.current = null;
-    if (id) {
-      void fetch(`/api/live/session/${id}`, { method: "DELETE" });
-    }
+    conn?.close();
   }, [stopMic]);
 
   /** Seal the learner bubble only — polish is on tap (beginner), never auto. */
@@ -706,50 +707,32 @@ export function SessionClient({
         cleanupSession();
         intentionalCloseRef.current = false;
 
-        const createRes = await fetch("/api/live/session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ scenarioId: activeScenario.id }),
-        });
-        const created = (await createRes.json()) as {
-          sessionId?: string;
-          practiceSessionId?: string;
-          model?: string;
-          error?: string;
-        };
-        if (!createRes.ok || !created.sessionId) {
-          throw new Error(
-            created.error ?? "Could not start the voice session — try again",
-          );
-        }
-
-        const boundSessionId = created.sessionId;
-        sessionIdRef.current = boundSessionId;
-        practiceSessionIdRef.current = created.practiceSessionId ?? null;
-
-        const es = new EventSource(`/api/live/session/${boundSessionId}`);
-        eventSourceRef.current = es;
-        es.onmessage = (msg) => {
-          // Drop events from a session that was replaced mid-flight.
-          if (sessionIdRef.current !== boundSessionId) return;
-          try {
-            const data = JSON.parse(msg.data) as LiveBridgeEvent | {
-              type: "subscribed";
-            };
+        const conn = await openLiveConnection({
+          scenarioId: activeScenario.id,
+          onReady: (ready) => {
+            sessionIdRef.current = ready.sessionId;
+            practiceSessionIdRef.current = ready.practiceSessionId ?? null;
+          },
+          onEvent: (data) => {
+            // onReady sets sessionIdRef before events; cleanup nulls it on tear-down.
+            if (!sessionIdRef.current) return;
             handleBridgeEvent(data);
-          } catch (err) {
-            console.error("[session] bad live event", err);
-          }
-        };
-        es.onerror = () => {
-          if (intentionalCloseRef.current) return;
-          if (sessionIdRef.current !== boundSessionId) return;
-          setStatus("error");
-          setStatusMessage("Event stream lost — tap Reconnect");
-          stopMic();
-        };
+          },
+          onTransportLost: () => {
+            if (intentionalCloseRef.current) return;
+            if (!sessionIdRef.current) return;
+            setStatus("error");
+            setStatusMessage("Event stream lost — tap Reconnect");
+            stopMic();
+          },
+        });
 
-        await startMic(boundSessionId);
+        liveConnRef.current = conn;
+        const boundSessionId = conn.sessionId;
+        sessionIdRef.current = boundSessionId;
+        practiceSessionIdRef.current = conn.practiceSessionId ?? null;
+
+        await startMic(boundSessionId, conn.sendAudio);
         if (sessionIdRef.current !== boundSessionId) return;
         setStatus("live");
         setStatusMessage(undefined);
