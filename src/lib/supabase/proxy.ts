@@ -43,8 +43,7 @@ export async function updateSession(request: NextRequest) {
   const userId = data?.claims?.sub ?? null;
 
   const path = request.nextUrl.pathname;
-  const isProtected =
-    path.startsWith("/session") || path.startsWith("/history");
+  const isProtected = path.startsWith("/session");
 
   if (!userId && isProtected) {
     const url = request.nextUrl.clone();
