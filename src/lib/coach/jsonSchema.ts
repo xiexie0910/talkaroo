@@ -51,15 +51,35 @@ export const learnerImproveJsonSchema = {
   required: [
     "mode",
     "user_sentence",
+    "heard_as_ko",
+    "meant_en",
     "natural_ko",
-    "tip_en",
+    "natural_en",
+    "formality",
+    "formality_fit",
+    "tips_en",
     "was_already_natural",
   ],
   properties: {
     mode: { type: "string", enum: ["learner_improve"] },
     user_sentence: { type: "string" },
+    heard_as_ko: { type: "string" },
+    meant_en: { type: "string" },
     natural_ko: { type: "string" },
-    tip_en: { type: "string" },
+    natural_en: { type: "string" },
+    formality: {
+      type: "string",
+      enum: ["banmal", "haeyo", "hapsyo", "mixed", "unclear"],
+    },
+    formality_fit: {
+      type: "string",
+      enum: ["fits", "too_casual", "too_formal", "n_a"],
+    },
+    tips_en: {
+      type: "array",
+      maxItems: 4,
+      items: { type: "string", minLength: 1, maxLength: 200 },
+    },
     was_already_natural: { type: "boolean" },
   },
 } as const;

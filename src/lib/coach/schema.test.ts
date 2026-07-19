@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  fixtureLearnerContextFix,
   fixtureLearnerGarbage,
   fixtureLearnerImprove,
   fixtureLearnerNatural,
@@ -24,8 +25,22 @@ describe("coach schema", () => {
     const parsed = parseCoachResponse(fixtureLearnerImprove);
     expect(parsed.mode).toBe("learner_improve");
     if (parsed.mode === "learner_improve") {
+      expect(parsed.heard_as_ko).toContain("김치");
+      expect(parsed.meant_en.length).toBeGreaterThan(0);
       expect(parsed.natural_ko).toContain("김치");
+      expect(parsed.tips_en.length).toBeGreaterThan(0);
+      expect(parsed.formality).toBe("haeyo");
       expect(parsed.was_already_natural).toBe(false);
+    }
+  });
+
+  it("accepts context/ASR fix fixture", () => {
+    const parsed = parseCoachResponse(fixtureLearnerContextFix);
+    expect(parsed.mode).toBe("learner_improve");
+    if (parsed.mode === "learner_improve") {
+      expect(parsed.meant_en.toLowerCase()).not.toContain("daegu");
+      expect(parsed.natural_ko).toContain("되게");
+      expect(parsed.tips_en.length).toBeGreaterThanOrEqual(2);
     }
   });
 

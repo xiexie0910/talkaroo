@@ -14,7 +14,6 @@ export const coachRequestSchema = z.object({
   turnId: z.string().max(128).optional(),
   practiceSessionId: z.string().max(64).optional(),
 });
-export type CoachRequest = z.infer<typeof coachRequestSchema>;
 
 const optionalNote = z
   .string()
@@ -43,11 +42,50 @@ export const partnerAssistSchema = z.object({
   suggested_replies: z.array(suggestedReplySchema).max(2),
 });
 
+/** Speech level of the learner line (or of the suggested rewrite). */
+export const formalitySchema = z.enum([
+  "banmal",
+  "haeyo",
+  "hapsyo",
+  "mixed",
+  "unclear",
+]);
+export type Formality = z.infer<typeof formalitySchema>;
+
+/** Whether that speech level fits the partner/scene context. */
+export const formalityFitSchema = z.enum([
+  "fits",
+  "too_casual",
+  "too_formal",
+  "n_a",
+]);
+export type FormalityFit = z.infer<typeof formalityFitSchema>;
+
+const tipItemSchema = z.string().min(1).max(200);
+
 export const learnerImproveSchema = z.object({
   mode: z.literal("learner_improve"),
+  /** Raw ASR / as given. */
   user_sentence: z.string(),
+  /** Cleaned Hangul of what they said (or best guess). */
+  heard_as_ko: z.string(),
+  /**
+   * What they were trying to communicate (intent), in plain English —
+   * not a literal gloss of wrong/ASR words.
+   */
+  meant_en: z.string(),
+  /** One natural native-sounding rewrite for this moment. */
   natural_ko: z.string(),
-  tip_en: z.string(),
+  /** Short English gloss of natural_ko. */
+  natural_en: z.string(),
+  /** Speech level of their line (or of natural_ko if theirs was unclear). */
+  formality: formalitySchema,
+  formality_fit: formalityFitSchema,
+  /**
+   * Distinct coaching bullets: meaning/ASR fixes, naturalness, formality.
+   * No duplicate points across bullets.
+   */
+  tips_en: z.array(tipItemSchema).max(4),
   was_already_natural: z.boolean(),
 });
 
@@ -87,10 +125,16 @@ export function emptyLearnerImprove(tip?: string): LearnerImproveResponse {
   return {
     mode: "learner_improve",
     user_sentence: "",
+    heard_as_ko: "",
+    meant_en: "",
     natural_ko: "",
-    tip_en:
+    natural_en: "",
+    formality: "unclear",
+    formality_fit: "n_a",
+    tips_en: [
       tip ??
-      "Couldn't catch clear Korean — try saying a short sentence in Korean.",
+        "Couldn't catch clear Korean — try saying a short sentence in Korean.",
+    ],
     was_already_natural: false,
   };
 }

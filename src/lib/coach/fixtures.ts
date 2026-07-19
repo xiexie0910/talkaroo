@@ -35,9 +35,32 @@ export const fixturePartnerAssist: CoachResponse = {
 export const fixtureLearnerImprove: CoachResponse = {
   mode: "learner_improve",
   user_sentence: "오늘 김치 먹었어요",
+  heard_as_ko: "오늘 김치 먹었어요",
+  meant_en: "I ate kimchi today.",
   natural_ko: "오늘 김치를 먹었어요.",
-  tip_en:
-    "Add object particle 를 after 김치 — Korean marks the thing eaten with 을/를.",
+  natural_en: "I ate kimchi today.",
+  formality: "haeyo",
+  formality_fit: "fits",
+  tips_en: [
+    "Mark the object: 김치 → 김치를 — same meaning, more natural.",
+  ],
+  was_already_natural: false,
+};
+
+/** ASR / context mix-up that should be corrected from partner context */
+export const fixtureLearnerContextFix: CoachResponse = {
+  mode: "learner_improve",
+  user_sentence: "맞아. 대구 오랜만이다. 잘 지냈어요.",
+  heard_as_ko: "맞아. 대구 오랜만이다. 잘 지냈어요.",
+  meant_en: "Right — it's been a really long time. Have you been well?",
+  natural_ko: "맞아. 되게 오랜만이다. 잘 지냈어?",
+  natural_en: "Right. It's been a really long time. Have you been well?",
+  formality: "mixed",
+  formality_fit: "too_formal",
+  tips_en: [
+    "대구 (Daegu, the city) doesn't fit here — you probably meant 되게 (“really”), like your partner said.",
+    "Keep one speech level with your friend: 잘 지냈어요 → 잘 지냈어?",
+  ],
   was_already_natural: false,
 };
 
@@ -45,8 +68,13 @@ export const fixtureLearnerImprove: CoachResponse = {
 export const fixtureLearnerNatural: CoachResponse = {
   mode: "learner_improve",
   user_sentence: "오늘 좀 바빴어요.",
+  heard_as_ko: "오늘 좀 바빴어요.",
+  meant_en: "I was a bit busy today.",
   natural_ko: "오늘 좀 바빴어요.",
-  tip_en: "Sounds natural and polite — nice everyday reply.",
+  natural_en: "I was a bit busy today.",
+  formality: "haeyo",
+  formality_fit: "fits",
+  tips_en: ["This already sounds like something a native would say here."],
   was_already_natural: true,
 };
 
@@ -54,7 +82,14 @@ export const fixtureLearnerNatural: CoachResponse = {
 export const fixtureLearnerGarbage: CoachResponse = {
   mode: "learner_improve",
   user_sentence: "",
+  heard_as_ko: "",
+  meant_en: "",
   natural_ko: "",
-  tip_en: "Couldn't catch clear Korean — try saying a short sentence in Korean.",
+  natural_en: "",
+  formality: "unclear",
+  formality_fit: "n_a",
+  tips_en: [
+    "Couldn't catch clear Korean — try saying a short sentence in Korean.",
+  ],
   was_already_natural: false,
 };
