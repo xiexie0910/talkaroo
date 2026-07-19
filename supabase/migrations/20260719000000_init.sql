@@ -1,4 +1,4 @@
--- Talkaroo: profiles + practice history (RLS-enabled)
+-- Talkaroo: profiles + practice sessions (RLS-enabled)
 
 create extension if not exists "pgcrypto";
 

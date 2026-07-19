@@ -1,4 +1,5 @@
 import type { CoachMode, CoachResponse } from "@/lib/coach/schema";
+import type { SessionRecap } from "@/lib/recap/schema";
 import type { createClient } from "@/lib/supabase/server";
 import type { Json } from "@/lib/supabase/types";
 
@@ -33,16 +34,77 @@ export async function createPracticeSession(
 
 export async function endPracticeSession(
   supabase: Supabase,
-  input: { userId: string; liveSessionId: string },
+  input:
+    | { userId: string; liveSessionId: string }
+    | { userId: string; practiceSessionId: string },
 ) {
-  const { error } = await supabase
+  let query = supabase
     .from("practice_sessions")
     .update({ status: "ended", ended_at: new Date().toISOString() })
-    .eq("live_session_id", input.liveSessionId)
     .eq("user_id", input.userId)
     .eq("status", "active");
 
+  if ("liveSessionId" in input) {
+    query = query.eq("live_session_id", input.liveSessionId);
+  } else {
+    query = query.eq("id", input.practiceSessionId);
+  }
+
+  const { error } = await query;
   if (error) throw new Error(error.message);
+}
+
+export async function getPracticeSessionForUser(
+  supabase: Supabase,
+  input: { userId: string; practiceSessionId: string },
+) {
+  const { data, error } = await supabase
+    .from("practice_sessions")
+    .select(
+      "id, user_id, live_session_id, scenario_id, title_ko, title_en, status, started_at, ended_at",
+    )
+    .eq("id", input.practiceSessionId)
+    .eq("user_id", input.userId)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+  return data;
+}
+
+export async function getSessionSummary(
+  supabase: Supabase,
+  practiceSessionId: string,
+) {
+  const { data, error } = await supabase
+    .from("practice_session_summaries")
+    .select("practice_session_id, recap, next_scenario_id, created_at")
+    .eq("practice_session_id", practiceSessionId)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+  return data;
+}
+
+export async function saveSessionSummary(
+  supabase: Supabase,
+  input: {
+    practiceSessionId: string;
+    recap: SessionRecap;
+    nextScenarioId: string;
+  },
+) {
+  const { data, error } = await supabase
+    .from("practice_session_summaries")
+    .insert({
+      practice_session_id: input.practiceSessionId,
+      recap: input.recap as unknown as Json,
+      next_scenario_id: input.nextScenarioId,
+    })
+    .select("practice_session_id, recap, next_scenario_id, created_at")
+    .single();
+
+  if (error) throw new Error(error.message);
+  return data;
 }
 
 export async function persistCoachTurn(
@@ -91,18 +153,3 @@ export async function persistCoachTurn(
   if (coachErr) throw new Error(coachErr.message);
 }
 
-export async function listPracticeSessions(
-  supabase: Supabase,
-  userId: string,
-  limit = 20,
-) {
-  const { data, error } = await supabase
-    .from("practice_sessions")
-    .select("id, scenario_id, title_ko, title_en, status, started_at, ended_at")
-    .eq("user_id", userId)
-    .order("started_at", { ascending: false })
-    .limit(limit);
-
-  if (error) throw new Error(error.message);
-  return data ?? [];
-}

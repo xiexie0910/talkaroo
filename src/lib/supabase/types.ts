@@ -67,7 +67,15 @@ export type Database = {
           ended_at?: string | null;
           created_at?: string;
         };
-        Relationships: [];
+        Relationships: [
+          {
+            foreignKeyName: "practice_sessions_user_id_fkey";
+            columns: ["user_id"];
+            isOneToOne: false;
+            referencedRelation: "profiles";
+            referencedColumns: ["id"];
+          },
+        ];
       };
       turns: {
         Row: {
@@ -122,6 +130,35 @@ export type Database = {
           created_at?: string;
         };
         Relationships: [];
+      };
+      practice_session_summaries: {
+        Row: {
+          practice_session_id: string;
+          recap: Json;
+          next_scenario_id: string;
+          created_at: string;
+        };
+        Insert: {
+          practice_session_id: string;
+          recap: Json;
+          next_scenario_id: string;
+          created_at?: string;
+        };
+        Update: {
+          practice_session_id?: string;
+          recap?: Json;
+          next_scenario_id?: string;
+          created_at?: string;
+        };
+        Relationships: [
+          {
+            foreignKeyName: "practice_session_summaries_practice_session_id_fkey";
+            columns: ["practice_session_id"];
+            isOneToOne: true;
+            referencedRelation: "practice_sessions";
+            referencedColumns: ["id"];
+          },
+        ];
       };
     };
     Views: Record<string, never>;
