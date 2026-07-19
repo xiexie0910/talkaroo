@@ -7,7 +7,6 @@
 | `/` | Marketing landing — photo hero + scroll sections |
 | `/session` | Live practice — scenarios, chat, inline coach |
 | `/login`, `/signup` | Auth forms |
-| `/history` | Past practice sessions |
 
 ## Session (most of the logic)
 

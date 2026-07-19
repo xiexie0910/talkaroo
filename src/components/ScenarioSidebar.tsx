@@ -33,13 +33,15 @@ export function ScenarioSidebar({
       <div className="scenario-sidebar-aura" aria-hidden />
 
       <div className="scenario-sidebar-top">
-        <p className="brand-mark">Talkaroo</p>
+        <Link href="/" className="brand-mark">
+          Talkaroo
+        </Link>
         <p className="scenario-sidebar-tagline">
           Pick a scene · coaching stays on tap
         </p>
       </div>
 
-      <div className="scenario-nav-label">Scenarios</div>
+      <div className="kicker scenario-nav-label">Scenarios</div>
       <nav className="scenario-list" aria-label="Practice scenarios">
         {scenarios.map((scenario, index) => {
           const active = scenario.id === selectedId;
@@ -74,7 +76,7 @@ export function ScenarioSidebar({
       </nav>
 
       <div className="scenario-level-block">
-        <div className="scenario-nav-label">Level</div>
+        <div className="kicker scenario-nav-label">Level</div>
         <div className="level-row" role="radiogroup" aria-label="Learner level">
           {LEARNER_LEVELS.map((item) => (
             <button
@@ -99,9 +101,6 @@ export function ScenarioSidebar({
       </div>
 
       <div className="scenario-sidebar-foot">
-        <Link href="/history" className="btn-secondary w-full text-center">
-          History
-        </Link>
         <SignOutButton />
       </div>
     </aside>

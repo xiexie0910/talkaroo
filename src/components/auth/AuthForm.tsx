@@ -71,14 +71,17 @@ export function AuthForm({ mode, nextPath = "/session", initialError }: AuthForm
 
   return (
     <div className="auth-shell">
-      <div className="auth-panel">
-        <p className="brand-mark">Talkaroo</p>
+      <div className="auth-panel glass-panel">
+        <Link href="/" className="brand-mark">
+          Talkaroo
+        </Link>
+        <p className="kicker">{mode === "login" ? "Sign in" : "Sign up"}</p>
         <h1 className="auth-title">
           {mode === "login" ? "Welcome back" : "Create your account"}
         </h1>
         <p className="auth-sub">
           {mode === "login"
-            ? "Sign in to continue Korean conversation practice."
+            ? "Continue Korean conversation practice."
             : "Save sessions and track what you practice."}
         </p>
 

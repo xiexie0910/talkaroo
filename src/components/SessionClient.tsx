@@ -12,14 +12,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PartnerPane, type ChatMessage } from "@/components/PartnerPane";
 import { ScenarioSidebar } from "@/components/ScenarioSidebar";
+import {
+  SessionRecapLoading,
+  SessionRecapPanel,
+} from "@/components/SessionRecapPanel";
 import type {
   CoachApiResult,
   CoachMode,
   CoachResponse,
 } from "@/lib/coach/schema";
+import {
+  startBrowserAsr,
+  type BrowserAsr,
+} from "@/lib/live/browserAsr";
 import { startMicCapture, type MicCapture } from "@/lib/live/micCapture";
 import { createPcmPlayer, type PcmPlayer } from "@/lib/live/pcmPlayer";
 import type { LiveBridgeEvent } from "@/lib/live/types";
+import type { CompleteSessionResult, SessionRecap } from "@/lib/recap/schema";
 import {
   getScenario,
   type LearnerLevel,
@@ -29,7 +38,11 @@ import { coachAffordance, shouldRunCoach } from "@/lib/session/level";
 import { msgId, patchMessage } from "@/lib/session/messages";
 import {
   isCoachableLearnerTranscript,
+  isDisplayableLearnerTranscript,
+  isNearDuplicateUtterance,
+  isTranscriptContinuation,
   mergeTranscriptChunk,
+  sanitizeLearnerTranscript,
 } from "@/lib/session/transcript";
 import type { ConnectionStatus } from "@/lib/session/types";
 import {
@@ -38,7 +51,25 @@ import {
 } from "@/lib/session/turnId";
 
 /** Extra client grace after Live turn_complete before sealing a user turn. */
-const USER_TURN_GRACE_MS = 1800;
+const USER_TURN_GRACE_MS = 2200;
+
+/**
+ * Partner transcription often lags / continues after an early turn_complete.
+ * Wait briefly so "어, 왔어!" + "어, 왔어! 주말인데…" stay one bubble.
+ */
+const PARTNER_TURN_GRACE_MS = 750;
+
+/** Merge/drop learner repeats spoken while waiting for the bubble to appear. */
+const USER_REPEAT_WINDOW_MS = 5000;
+
+/**
+ * Keep mic muted briefly after partner audio so speaker echo / room reverb
+ * isn't transcribed as the learner.
+ */
+const PARTNER_MIC_HANGOVER_MS = 500;
+
+/** Reflect only after the learner has spoken more than this many sealed turns. */
+const REFLECT_MIN_USER_TURNS = 3;
 
 type LastCoachRequest = {
   mode: CoachMode;
@@ -47,13 +78,35 @@ type LastCoachRequest = {
   messageId: string;
 };
 
-export function SessionClient() {
+export type SessionMissionHandoff = {
+  objective: string;
+  starterPhrase?: string;
+};
+
+type SessionClientProps = {
+  initialScenarioId?: string | null;
+  initialMission?: SessionMissionHandoff | null;
+};
+
+export function SessionClient({
+  initialScenarioId = null,
+  initialMission = null,
+}: SessionClientProps) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [statusMessage, setStatusMessage] = useState<string | undefined>();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [textFallback, setTextFallback] = useState("");
-  const [scenario, setScenario] = useState<Scenario>(() => getScenario());
+  const [scenario, setScenario] = useState<Scenario>(() =>
+    getScenario(initialScenarioId),
+  );
   const [level, setLevel] = useState<LearnerLevel>("beginner");
+  const [missionBanner, setMissionBanner] = useState<SessionMissionHandoff | null>(
+    () => initialMission,
+  );
+  const [recapPhase, setRecapPhase] = useState<"none" | "loading" | "ready">(
+    "none",
+  );
+  const [recap, setRecap] = useState<SessionRecap | null>(null);
 
   // Refs keep latest values inside SSE / audio callbacks without re-subscribing
   const sessionIdRef = useRef<string | null>(null);
@@ -63,14 +116,26 @@ export function SessionClient() {
   const coachAbortRef = useRef<AbortController | null>(null);
   const lastCoachRef = useRef<LastCoachRequest | null>(null);
   const lastPartnerLineRef = useRef("");
+  const lastPartnerMsgIdRef = useRef<string | null>(null);
+  const lastUserLineRef = useRef("");
+  const lastUserMsgIdRef = useRef<string | null>(null);
+  const lastUserSealedAtRef = useRef(0);
+  /** performance.now() deadline — mute uplink while partner plays on speakers. */
+  const partnerMicMuteUntilRef = useRef(0);
   const playerRef = useRef<PcmPlayer | null>(null);
   const micRef = useRef<MicCapture | null>(null);
+  const browserAsrRef = useRef<BrowserAsr | null>(null);
+  /** Once Live ASR speaks for this turn, it wins over browser captions. */
+  const liveUserAsrRef = useRef(false);
   const intentionalCloseRef = useRef(false);
   const partnerBufRef = useRef("");
   const userBufRef = useRef("");
   const partnerMsgIdRef = useRef<string | null>(null);
   const userMsgIdRef = useRef<string | null>(null);
   const userTurnFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const partnerTurnFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
   const scenarioRef = useRef<Scenario>(scenario);
@@ -218,32 +283,254 @@ export function SessionClient() {
 
   const flushPlayback = useCallback(() => {
     playerRef.current?.flush();
+    partnerMicMuteUntilRef.current = 0;
+  }, []);
+
+  const isPartnerAudioBlockingMic = useCallback(() => {
+    const player = playerRef.current;
+    if (player?.isBusy()) return true;
+    return performance.now() < partnerMicMuteUntilRef.current;
+  }, []);
+
+  const notePartnerAudioPlaying = useCallback(() => {
+    const player = playerRef.current;
+    const queued = player?.queuedMsRemaining() ?? 0;
+    partnerMicMuteUntilRef.current = Math.max(
+      partnerMicMuteUntilRef.current,
+      performance.now() + queued + PARTNER_MIC_HANGOVER_MS,
+    );
   }, []);
 
   const stopMic = useCallback(() => {
+    browserAsrRef.current?.stop();
+    browserAsrRef.current = null;
+    liveUserAsrRef.current = false;
     micRef.current?.stop();
     micRef.current = null;
   }, []);
 
   const playPcmChunk = useCallback(
     (base64: string) => {
-      void ensurePlayer().playBase64(base64);
+      const player = ensurePlayer();
+      // Mute mic uplink immediately — don't wait for the chunk to finish decoding.
+      partnerMicMuteUntilRef.current = Math.max(
+        partnerMicMuteUntilRef.current,
+        performance.now() + PARTNER_MIC_HANGOVER_MS,
+      );
+      void player.playBase64(base64).finally(() => {
+        notePartnerAudioPlaying();
+      });
+      notePartnerAudioPlaying();
     },
-    [ensurePlayer],
+    [ensurePlayer, notePartnerAudioPlaying],
   );
 
-  const startMic = useCallback(async (sessionId: string) => {
-    stopMic();
-    micRef.current = await startMicCapture({
-      sessionId,
-      isActive: () => sessionIdRef.current === sessionId,
-    });
-  }, [stopMic]);
+  const clearUserTurnFlushTimer = useCallback(() => {
+    if (userTurnFlushTimerRef.current) {
+      clearTimeout(userTurnFlushTimerRef.current);
+      userTurnFlushTimerRef.current = null;
+    }
+  }, []);
+
+  const clearPartnerTurnFlushTimer = useCallback(() => {
+    if (partnerTurnFlushTimerRef.current) {
+      clearTimeout(partnerTurnFlushTimerRef.current);
+      partnerTurnFlushTimerRef.current = null;
+    }
+  }, []);
+
+  const sealPartnerTurn = useCallback(() => {
+    const text = partnerBufRef.current.trim();
+    partnerBufRef.current = "";
+    const id = finalizeStreaming("partner", partnerMsgIdRef);
+    if (text && id) {
+      lastPartnerLineRef.current = text;
+      lastPartnerMsgIdRef.current = id;
+    }
+    return { text, messageId: id };
+  }, [finalizeStreaming]);
+
+  const sealUserTurn = useCallback(() => {
+    const raw = userBufRef.current;
+    userBufRef.current = "";
+    const text = sanitizeLearnerTranscript(raw);
+    const id = userMsgIdRef.current;
+
+    // Drop bubbles that are only ASR junk ("{}", "{Rolle}", etc.).
+    if (!isDisplayableLearnerTranscript(text)) {
+      userMsgIdRef.current = null;
+      if (id) {
+        setMessages((prev) => prev.filter((m) => m.id !== id));
+      }
+      return { text: "", messageId: null };
+    }
+
+    const recentRepeat =
+      lastUserMsgIdRef.current &&
+      Date.now() - lastUserSealedAtRef.current < USER_REPEAT_WINDOW_MS &&
+      isNearDuplicateUtterance(lastUserLineRef.current, text);
+
+    // Learner repeated themselves waiting for UI — keep one bubble.
+    if (recentRepeat && id && id !== lastUserMsgIdRef.current) {
+      const keepId = lastUserMsgIdRef.current!;
+      const keepText =
+        text.length > lastUserLineRef.current.length
+          ? text
+          : lastUserLineRef.current;
+      userMsgIdRef.current = null;
+      lastUserLineRef.current = keepText;
+      lastUserSealedAtRef.current = Date.now();
+      setMessages((prev) =>
+        prev
+          .filter((m) => m.id !== id)
+          .map((m) =>
+            m.id === keepId ? { ...m, pending: false, text: keepText } : m,
+          ),
+      );
+      return { text: keepText, messageId: keepId };
+    }
+
+    userMsgIdRef.current = null;
+    lastUserLineRef.current = text;
+    lastUserMsgIdRef.current = id;
+    lastUserSealedAtRef.current = Date.now();
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === id ? { ...m, pending: false, text } : m,
+      ),
+    );
+    return { text, messageId: id };
+  }, []);
+
+  const flushPartnerTurn = useCallback(() => {
+    clearPartnerTurnFlushTimer();
+    return sealPartnerTurn();
+  }, [clearPartnerTurnFlushTimer, sealPartnerTurn]);
+
+  const schedulePartnerTurnFlush = useCallback(() => {
+    clearPartnerTurnFlushTimer();
+    if (!partnerBufRef.current.trim() && !partnerMsgIdRef.current) return;
+    partnerTurnFlushTimerRef.current = setTimeout(() => {
+      partnerTurnFlushTimerRef.current = null;
+      flushPartnerTurn();
+    }, PARTNER_TURN_GRACE_MS);
+  }, [clearPartnerTurnFlushTimer, flushPartnerTurn]);
+
+  /** If Live continues the last sealed partner line, reopen that bubble. */
+  const reopenPartnerIfContinuation = useCallback(
+    (incoming: string) => {
+      const lastId = lastPartnerMsgIdRef.current;
+      const lastText = lastPartnerLineRef.current;
+      if (!lastId || !lastText) return false;
+      if (!isTranscriptContinuation(lastText, incoming)) return false;
+      partnerMsgIdRef.current = lastId;
+      partnerBufRef.current = lastText;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === lastId ? { ...m, pending: true, text: lastText } : m,
+        ),
+      );
+      return true;
+    },
+    [],
+  );
+
+  const applyUserCaption = useCallback(
+    (text: string, mode: "replace" | "append") => {
+      // Speakers → mic echo of the partner must not become a "You" bubble.
+      if (isPartnerAudioBlockingMic()) return;
+
+      const cleaned = sanitizeLearnerTranscript(text);
+      // Ignore noise captions; keep any good text already in the bubble.
+      if (!isDisplayableLearnerTranscript(cleaned)) return;
+
+      // Extra guard: caption matches what the partner just said.
+      if (
+        lastPartnerLineRef.current &&
+        isNearDuplicateUtterance(cleaned, lastPartnerLineRef.current)
+      ) {
+        return;
+      }
+
+      clearUserTurnFlushTimer();
+
+      // Repeat while waiting for the last bubble → reopen it instead of a 2nd line.
+      if (
+        !userMsgIdRef.current &&
+        lastUserMsgIdRef.current &&
+        Date.now() - lastUserSealedAtRef.current < USER_REPEAT_WINDOW_MS &&
+        (isNearDuplicateUtterance(lastUserLineRef.current, cleaned) ||
+          isTranscriptContinuation(lastUserLineRef.current, cleaned))
+      ) {
+        userMsgIdRef.current = lastUserMsgIdRef.current;
+        userBufRef.current = lastUserLineRef.current;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === lastUserMsgIdRef.current
+              ? { ...m, pending: true, text: lastUserLineRef.current }
+              : m,
+          ),
+        );
+      }
+
+      if (!userBufRef.current) {
+        flushPlayback();
+        flushPartnerTurn();
+      }
+      userBufRef.current = mergeTranscriptChunk(
+        userBufRef.current,
+        cleaned,
+        mode,
+      );
+      const display = sanitizeLearnerTranscript(userBufRef.current);
+      if (!isDisplayableLearnerTranscript(display)) return;
+      userBufRef.current = display;
+      upsertStreaming("user", display, userMsgIdRef);
+    },
+    [
+      clearUserTurnFlushTimer,
+      flushPartnerTurn,
+      flushPlayback,
+      isPartnerAudioBlockingMic,
+      upsertStreaming,
+    ],
+  );
+
+  const startMic = useCallback(
+    async (sessionId: string) => {
+      stopMic();
+      micRef.current = await startMicCapture({
+        sessionId,
+        isActive: () => sessionIdRef.current === sessionId,
+        // Don't upload speaker bleed while the partner is talking.
+        shouldSend: () =>
+          sessionIdRef.current === sessionId && !isPartnerAudioBlockingMic(),
+      });
+      // Instant captions while speaking — Live ASR often arrives only at turn end.
+      liveUserAsrRef.current = false;
+      browserAsrRef.current = startBrowserAsr({
+        lang: "ko-KR",
+        isActive: () =>
+          sessionIdRef.current === sessionId && !isPartnerAudioBlockingMic(),
+        onUpdate: (text) => {
+          if (sessionIdRef.current !== sessionId) return;
+          if (liveUserAsrRef.current) return;
+          if (isPartnerAudioBlockingMic()) return;
+          applyUserCaption(text, "replace");
+        },
+      });
+    },
+    [applyUserCaption, isPartnerAudioBlockingMic, stopMic],
+  );
 
   const cleanupSession = useCallback(() => {
     if (userTurnFlushTimerRef.current) {
       clearTimeout(userTurnFlushTimerRef.current);
       userTurnFlushTimerRef.current = null;
+    }
+    if (partnerTurnFlushTimerRef.current) {
+      clearTimeout(partnerTurnFlushTimerRef.current);
+      partnerTurnFlushTimerRef.current = null;
     }
     coachAbortRef.current?.abort();
     coachAbortRef.current = null;
@@ -261,31 +548,12 @@ export function SessionClient() {
     }
   }, [stopMic]);
 
-  const clearUserTurnFlushTimer = useCallback(() => {
-    if (userTurnFlushTimerRef.current) {
-      clearTimeout(userTurnFlushTimerRef.current);
-      userTurnFlushTimerRef.current = null;
-    }
-  }, []);
-
-  const sealPartnerTurn = useCallback(() => {
-    const text = partnerBufRef.current.trim();
-    partnerBufRef.current = "";
-    const id = finalizeStreaming("partner", partnerMsgIdRef);
-    return { text, messageId: id };
-  }, [finalizeStreaming]);
-
-  const sealUserTurn = useCallback(() => {
-    const text = userBufRef.current.trim();
-    userBufRef.current = "";
-    const id = finalizeStreaming("user", userMsgIdRef);
-    return { text, messageId: id };
-  }, [finalizeStreaming]);
-
   /** Seal the learner bubble only — polish is on tap (beginner), never auto. */
   const flushUserTurn = useCallback(() => {
     clearUserTurnFlushTimer();
     sealUserTurn();
+    liveUserAsrRef.current = false;
+    browserAsrRef.current?.resetTurn();
   }, [clearUserTurnFlushTimer, sealUserTurn]);
 
   const scheduleUserTurnFlush = useCallback(() => {
@@ -308,10 +576,7 @@ export function SessionClient() {
       if (event.type === "interrupted") {
         // Gemini Live barge-in: stop queued PCM or old + new turns overlap.
         flushPlayback();
-        const sealed = sealPartnerTurn();
-        if (sealed.text && sealed.messageId) {
-          lastPartnerLineRef.current = sealed.text;
-        }
+        flushPartnerTurn();
         return;
       }
       if (event.type === "audio") {
@@ -326,6 +591,15 @@ export function SessionClient() {
         if (userBufRef.current.trim() || userMsgIdRef.current) {
           flushUserTurn();
         }
+        clearPartnerTurnFlushTimer();
+        // Early turn_complete can seal mid-utterance; reopen if ASR continues it.
+        if (
+          !partnerMsgIdRef.current &&
+          !partnerBufRef.current.trim() &&
+          reopenPartnerIfContinuation(event.text)
+        ) {
+          /* buffer + id restored */
+        }
         partnerBufRef.current = mergeTranscriptChunk(
           partnerBufRef.current,
           event.text,
@@ -335,28 +609,38 @@ export function SessionClient() {
         return;
       }
       if (event.type === "input_transcription") {
-        // More learner audio — cancel grace so a think-pause can continue one bubble.
-        clearUserTurnFlushTimer();
-        if (!userBufRef.current) {
-          flushPlayback();
-          const sealed = sealPartnerTurn();
-          if (sealed.text && sealed.messageId) {
-            lastPartnerLineRef.current = sealed.text;
+        // Ignore echo ASR while partner audio is on speakers.
+        if (isPartnerAudioBlockingMic()) return;
+        // Live ASR is authoritative, but keep the browser preview on screen until
+        // Live text arrives — wiping here made users think nothing was heard.
+        if (!liveUserAsrRef.current) {
+          liveUserAsrRef.current = true;
+          const preview = userBufRef.current;
+          const liveText = sanitizeLearnerTranscript(event.text);
+          if (
+            preview &&
+            liveText &&
+            (isNearDuplicateUtterance(preview, liveText) ||
+              isTranscriptContinuation(preview, liveText) ||
+              isTranscriptContinuation(liveText, preview))
+          ) {
+            applyUserCaption(
+              liveText.length >= preview.length ? liveText : preview,
+              "replace",
+            );
+            return;
+          }
+          // Fresh Live deltas that aren't the same line — start from Live text.
+          if (event.mode === "append" && liveText) {
+            userBufRef.current = "";
           }
         }
-        userBufRef.current = mergeTranscriptChunk(
-          userBufRef.current,
-          event.text,
-          event.mode,
-        );
-        upsertStreaming("user", userBufRef.current, userMsgIdRef);
+        applyUserCaption(event.text, event.mode);
         return;
       }
       if (event.type === "turn_complete") {
-        const partnerSealed = sealPartnerTurn();
-        if (partnerSealed.text && partnerSealed.messageId) {
-          lastPartnerLineRef.current = partnerSealed.text;
-        }
+        // Delay partner seal — output ASR often continues after turn_complete.
+        schedulePartnerTurnFlush();
         // Don't seal the learner immediately — short pauses are normal when speaking L2.
         scheduleUserTurnFlush();
         return;
@@ -376,12 +660,17 @@ export function SessionClient() {
       }
     },
     [
+      applyUserCaption,
+      clearPartnerTurnFlushTimer,
       clearUserTurnFlushTimer,
+      flushPartnerTurn,
       flushPlayback,
       flushUserTurn,
+      isPartnerAudioBlockingMic,
       playPcmChunk,
+      reopenPartnerIfContinuation,
+      schedulePartnerTurnFlush,
       scheduleUserTurnFlush,
-      sealPartnerTurn,
       stopMic,
       upsertStreaming,
     ],
@@ -390,6 +679,9 @@ export function SessionClient() {
   const connectLive = useCallback(
     async (mode: "connect" | "reconnect", nextScenario?: Scenario) => {
       const activeScenario = nextScenario ?? scenarioRef.current;
+      setRecapPhase("none");
+      setRecap(null);
+      setMissionBanner(null);
       setStatus(mode === "reconnect" ? "reconnecting" : "connecting");
       setStatusMessage(
         mode === "reconnect"
@@ -401,6 +693,10 @@ export function SessionClient() {
       partnerMsgIdRef.current = null;
       userMsgIdRef.current = null;
       lastPartnerLineRef.current = "";
+      lastPartnerMsgIdRef.current = null;
+      lastUserLineRef.current = "";
+      lastUserMsgIdRef.current = null;
+      lastUserSealedAtRef.current = 0;
       lastCoachRef.current = null;
       setMessages([]);
 
@@ -423,8 +719,7 @@ export function SessionClient() {
         };
         if (!createRes.ok || !created.sessionId) {
           throw new Error(
-            created.error ??
-              "Could not start Live session (ADC / Vertex / auth?)",
+            created.error ?? "Could not start the voice session — try again",
           );
         }
 
@@ -489,6 +784,90 @@ export function SessionClient() {
     setStatus("idle");
     setStatusMessage(undefined);
     setMessages([]);
+    setRecapPhase("none");
+    setRecap(null);
+  };
+
+  const sealedUserTurnCount = messages.filter(
+    (m) => m.role === "user" && !m.pending && m.text.trim(),
+  ).length;
+  const canReflect = sealedUserTurnCount > REFLECT_MIN_USER_TURNS;
+
+  const endAndReflect = async () => {
+    const practiceSessionId = practiceSessionIdRef.current;
+    const transcript = messages
+      .filter((m) => m.text.trim() && !m.pending)
+      .map((m) => ({ role: m.role, text: m.text.trim() }));
+
+    intentionalCloseRef.current = true;
+    cleanupSession();
+    setStatus("idle");
+    setStatusMessage(undefined);
+    setMessages([]);
+    setRecapPhase("loading");
+    setRecap(null);
+
+    if (!practiceSessionId) {
+      setRecapPhase("none");
+      return;
+    }
+
+    try {
+      const res = await fetch(
+        `/api/practice/sessions/${practiceSessionId}/complete`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transcript }),
+        },
+      );
+      const json = (await res.json()) as CompleteSessionResult;
+      if (!res.ok || "error" in json && json.error) {
+        throw new Error(
+          "error" in json && json.error ? json.message : "Recap failed",
+        );
+      }
+      if (!("recap" in json) || !json.recap) {
+        throw new Error("Recap missing");
+      }
+      setRecap(json.recap);
+      setRecapPhase("ready");
+    } catch (err) {
+      console.error("[session] reflect failed", err);
+      setRecapPhase("none");
+      setStatusMessage(
+        err instanceof Error ? err.message : "Could not build your recap",
+      );
+    }
+  };
+
+  const dismissRecap = () => {
+    setRecapPhase("none");
+    setRecap(null);
+  };
+
+  const practiceRecapMission = () => {
+    if (!recap) {
+      dismissRecap();
+      return;
+    }
+    setScenario(getScenario(recap.nextMission.scenarioId));
+    setMissionBanner({
+      objective: recap.nextMission.objective,
+      starterPhrase: recap.nextMission.starterPhrase,
+    });
+    setMessages([]);
+    setStatus("idle");
+    setStatusMessage(undefined);
+    dismissRecap();
+  };
+
+  const backToPractice = () => {
+    setMissionBanner(null);
+    setMessages([]);
+    setStatus("idle");
+    setStatusMessage(undefined);
+    dismissRecap();
   };
 
   const onSelectScenario = (next: Scenario) => {
@@ -500,8 +879,14 @@ export function SessionClient() {
     ) {
       return;
     }
+    // Leaving recap via sidebar should feel like "back to practice".
+    if (recapPhase !== "none") {
+      dismissRecap();
+      setMissionBanner(null);
+    }
     if (next.id === scenario.id) return;
     setScenario(next);
+    setMissionBanner(null);
   };
 
   const affordance = coachAffordance(level);
@@ -568,18 +953,14 @@ export function SessionClient() {
       <div className="session-main">
         <header className="session-main-top">
           <div className="session-context min-w-0">
-            <p className="session-context-label">Conversation studio</p>
             <h1 className="session-context-title">
               <span lang="ko">{scenario.titleKo}</span>
               <span className="session-context-en">{scenario.titleEn}</span>
-            </h1>
-            <p className="session-context-meta">
-              Level
               <span className="session-context-separator" aria-hidden>
                 ·
               </span>
               <span className="session-context-level">{level}</span>
-            </p>
+            </h1>
           </div>
           <div className="session-actions">
             <span
@@ -605,6 +986,14 @@ export function SessionClient() {
               >
                 {status === "error" ? "Reconnect" : "Start session"}
               </button>
+            ) : canReflect ? (
+              <button
+                type="button"
+                className="btn-secondary session-end-btn"
+                onClick={() => void endAndReflect()}
+              >
+                End &amp; reflect
+              </button>
             ) : (
               <button
                 type="button"
@@ -618,19 +1007,43 @@ export function SessionClient() {
         </header>
 
         <div className="session-chat-wrap">
-          <PartnerPane
-            titleKo={scenario.titleKo}
-            status={status}
-            messages={messages}
-            statusMessage={statusMessage}
-            allowPartnerCoach={affordance.partnerAssist}
-            allowLearnerPolish={affordance.learnerImprove}
-            onUnderstandPartner={onUnderstandPartner}
-            onPolishLearner={onPolishLearner}
-            onRetryCoach={onRetryCoach}
-          />
+          {recapPhase === "loading" ? (
+            <SessionRecapLoading />
+          ) : recapPhase === "ready" && recap ? (
+            <SessionRecapPanel
+              recap={recap}
+              onPracticeMission={practiceRecapMission}
+              onBackToPractice={backToPractice}
+            />
+          ) : (
+            <>
+              {missionBanner && status === "idle" ? (
+                <div className="mission-banner">
+                  <p className="mission-banner-label">Next mission</p>
+                  <p className="mission-banner-body">{missionBanner.objective}</p>
+                  {missionBanner.starterPhrase ? (
+                    <p className="mission-banner-starter" lang="ko">
+                      Starter: {missionBanner.starterPhrase}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+              <PartnerPane
+                titleKo={scenario.titleKo}
+                status={status}
+                messages={messages}
+                statusMessage={statusMessage}
+                allowPartnerCoach={affordance.partnerAssist}
+                allowLearnerPolish={affordance.learnerImprove}
+                onUnderstandPartner={onUnderstandPartner}
+                onPolishLearner={onPolishLearner}
+                onRetryCoach={onRetryCoach}
+              />
+            </>
+          )}
         </div>
 
+        {recapPhase === "none" ? (
         <form className="fallback-bar" onSubmit={onTextSubmit}>
           <div className="fallback-controls">
             <label className="sr-only" htmlFor="text-fallback">
@@ -648,6 +1061,7 @@ export function SessionClient() {
             </button>
           </div>
         </form>
+        ) : null}
       </div>
     </div>
   );

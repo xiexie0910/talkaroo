@@ -113,24 +113,60 @@ export function InlineCoachCard({
   }
 
   if (role === "user" && learnerImprove) {
-    if (!learnerImprove.natural_ko && !learnerImprove.tip_en) return null;
+    if (
+      !learnerImprove.heard_as_ko &&
+      !learnerImprove.natural_ko &&
+      learnerImprove.tips_en.length === 0
+    ) {
+      return null;
+    }
 
     return (
       <div className="inline-coach" data-state="ready">
-        <p className="inline-coach-label">
-          {learnerImprove.was_already_natural ? "Sounds good" : "More natural"}
-        </p>
-        {learnerImprove.natural_ko ? (
-          <div
-            className={`try-box ${learnerImprove.was_already_natural ? "try-box-ok" : ""}`}
-          >
-            <p lang="ko">{learnerImprove.natural_ko}</p>
+        {learnerImprove.heard_as_ko || learnerImprove.meant_en ? (
+          <div className="coach-section">
+            <p className="inline-coach-label">You said</p>
+            {learnerImprove.heard_as_ko ? (
+              <p className="coach-heard" lang="ko">
+                {learnerImprove.heard_as_ko}
+              </p>
+            ) : null}
+            {learnerImprove.meant_en ? (
+              <p className="coach-meant">
+                You meant: {learnerImprove.meant_en}
+              </p>
+            ) : null}
           </div>
         ) : null}
-        {learnerImprove.tip_en ? (
+
+        {learnerImprove.natural_ko ? (
+          <div
+            className={`coach-section ${learnerImprove.heard_as_ko || learnerImprove.meant_en ? "mt-3" : ""}`}
+          >
+            <p className="inline-coach-label">
+              {learnerImprove.was_already_natural
+                ? "Sounds natural"
+                : "Native would say"}
+            </p>
+            <div
+              className={`try-box ${learnerImprove.was_already_natural ? "try-box-ok" : ""}`}
+            >
+              <p lang="ko">{learnerImprove.natural_ko}</p>
+              {learnerImprove.natural_en ? (
+                <p className="reply-en mt-1">{learnerImprove.natural_en}</p>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
+
+        {learnerImprove.tips_en.length > 0 ? (
           <div className="why-box mt-2">
-            <strong>Tip</strong>
-            <p>{learnerImprove.tip_en}</p>
+            <strong>Tips</strong>
+            <ul className="coach-tips">
+              {learnerImprove.tips_en.map((tip, i) => (
+                <li key={`${i}-${tip.slice(0, 24)}`}>{tip}</li>
+              ))}
+            </ul>
           </div>
         ) : null}
       </div>

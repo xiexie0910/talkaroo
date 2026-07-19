@@ -59,7 +59,7 @@ export function LandingProof({ reducedMotion }: LandingProofProps) {
     <>
       <section id="method" className="scroll-section method-section">
         <div className="method-sticky">
-          <p className="scroll-eyebrow">A better rhythm</p>
+          <p className="kicker scroll-eyebrow">A better rhythm</p>
           <h2 className="method-title">
             Built for the
             <br />
@@ -122,7 +122,7 @@ export function LandingProof({ reducedMotion }: LandingProofProps) {
       </section>
 
       <section id="start" className="scroll-section closing-section">
-        <p className="scroll-eyebrow reveal">Your first conversation is waiting</p>
+        <p className="kicker scroll-eyebrow reveal">Your first conversation is waiting</p>
         <h2 className="closing-title reveal">
           Make room for
           <br />

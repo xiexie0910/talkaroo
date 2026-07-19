@@ -48,7 +48,7 @@ export function LandingOverlay({ progress, reducedMotion }: LandingOverlayProps)
           <a href="#stories">Stories</a>
           <Link href="/login?next=/session">Sign in</Link>
         </nav>
-        <Link href="/session" className="landing-nav-cta">
+        <Link href="/session" className="landing-nav-cta btn-primary-sm">
           Start practicing <span aria-hidden>↗</span>
         </Link>
       </div>
