@@ -45,7 +45,9 @@ import {
   isDisplayableLearnerTranscript,
   isNearDuplicateUtterance,
   isTranscriptContinuation,
+  looksLikeEchoOfPartner,
   mergeTranscriptChunk,
+  preferLearnerCaption,
   sanitizeLearnerTranscript,
 } from "@/lib/session/transcript";
 import type { ConnectionStatus } from "@/lib/session/types";
@@ -70,7 +72,14 @@ const USER_REPEAT_WINDOW_MS = 5000;
  * Keep mic muted briefly after partner audio so speaker echo / room reverb
  * isn't transcribed as the learner.
  */
-const PARTNER_MIC_HANGOVER_MS = 500;
+const PARTNER_MIC_HANGOVER_MS = 1000;
+
+/**
+ * After partner playback, only uplink mic frames with real speech energy so
+ * quiet room reverb isn't sent to Live.
+ */
+const POST_PARTNER_MIC_GATE_MS = 2000;
+const POST_PARTNER_SPEAK_RMS = 0.015;
 
 /** Reflect only after the learner has spoken more than this many sealed turns. */
 const REFLECT_MIN_USER_TURNS = 3;
@@ -126,6 +135,8 @@ export function SessionClient({
   const lastUserSealedAtRef = useRef(0);
   /** performance.now() deadline — mute uplink while partner plays on speakers. */
   const partnerMicMuteUntilRef = useRef(0);
+  /** After partner audio, require mic energy before uplink resumes. */
+  const postPartnerMicGateUntilRef = useRef(0);
   const playerRef = useRef<PcmPlayer | null>(null);
   const micRef = useRef<MicCapture | null>(null);
   const browserAsrRef = useRef<BrowserAsr | null>(null);
@@ -288,6 +299,30 @@ export function SessionClient({
   const flushPlayback = useCallback(() => {
     playerRef.current?.flush();
     partnerMicMuteUntilRef.current = 0;
+    // #region agent log
+    const body = JSON.stringify({
+      sessionId: "647797",
+      runId: "echo-post",
+      hypothesisId: "F",
+      location: "SessionClient.tsx:flushPlayback",
+      message: "playback flushed; mute cleared",
+      data: {},
+      timestamp: Date.now(),
+    });
+    fetch("http://127.0.0.1:7371/ingest/09059100-ba34-4f53-8078-bfa35b282dd6", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Debug-Session-Id": "647797",
+      },
+      body,
+    }).catch(() => {});
+    fetch("/api/debug/ingest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+    }).catch(() => {});
+    // #endregion
   }, []);
 
   const isPartnerAudioBlockingMic = useCallback(() => {
@@ -296,13 +331,90 @@ export function SessionClient({
     return performance.now() < partnerMicMuteUntilRef.current;
   }, []);
 
+  const isLikelyPartnerEchoCaption = useCallback((text: string) => {
+    const partners = [partnerBufRef.current, lastPartnerLineRef.current];
+    return partners.some(
+      (partner) => partner && looksLikeEchoOfPartner(text, partner),
+    );
+  }, []);
+
+  const shouldIgnoreLiveInputAsr = useCallback(
+    (text: string) => {
+      if (isPartnerAudioBlockingMic()) return true;
+      // Drop speaker-bleed captions that match the partner line.
+      if (isLikelyPartnerEchoCaption(text)) return true;
+      return false;
+    },
+    [isLikelyPartnerEchoCaption, isPartnerAudioBlockingMic],
+  );
+
+  // #region agent log
+  const debugEchoLog = useCallback(
+    (
+      hypothesisId: string,
+      location: string,
+      message: string,
+      data: Record<string, unknown>,
+    ) => {
+      const player = playerRef.current;
+      const now = performance.now();
+      const busy = player?.isBusy() ?? false;
+      const queuedMs = player?.queuedMsRemaining() ?? 0;
+      const muteUntilIn = Math.max(0, partnerMicMuteUntilRef.current - now);
+      const blocking = busy || now < partnerMicMuteUntilRef.current;
+      const payload = {
+        sessionId: "647797",
+        runId: "echo-post",
+        hypothesisId,
+        location,
+        message,
+        data: {
+          ...data,
+          busy,
+          queuedMs,
+          muteUntilIn,
+          blocking,
+          ignoreAsrIn: 0,
+          micGateIn: Math.max(0, postPartnerMicGateUntilRef.current - now),
+          rms: micRef.current?.inputRms() ?? null,
+        },
+        timestamp: Date.now(),
+      };
+      const body = JSON.stringify(payload);
+      // Cursor debug ingest (may fail from HTTPS / CORS).
+      fetch("http://127.0.0.1:7371/ingest/09059100-ba34-4f53-8078-bfa35b282dd6", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Debug-Session-Id": "647797",
+        },
+        body,
+      }).catch(() => {});
+      // Same-origin fallback so local/vercel-dev always captures logs.
+      fetch("/api/debug/ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      }).catch(() => {});
+    },
+    [],
+  );
+  // #endregion
+
   const notePartnerAudioPlaying = useCallback(() => {
     const player = playerRef.current;
     const queued = player?.queuedMsRemaining() ?? 0;
+    const now = performance.now();
     partnerMicMuteUntilRef.current = Math.max(
       partnerMicMuteUntilRef.current,
-      performance.now() + queued + PARTNER_MIC_HANGOVER_MS,
+      now + queued + PARTNER_MIC_HANGOVER_MS,
     );
+    postPartnerMicGateUntilRef.current = Math.max(
+      postPartnerMicGateUntilRef.current,
+      now + queued + PARTNER_MIC_HANGOVER_MS + POST_PARTNER_MIC_GATE_MS,
+    );
+    // Partner audio on speakers contaminates Chrome ASR's committed buffer.
+    browserAsrRef.current?.resetTurn();
   }, []);
 
   const stopMic = useCallback(() => {
@@ -323,10 +435,20 @@ export function SessionClient({
       );
       void player.playBase64(base64).finally(() => {
         notePartnerAudioPlaying();
+        // #region agent log
+        debugEchoLog("C", "SessionClient.tsx:playPcmChunk.finally", "after schedule", {
+          base64Chars: base64.length,
+        });
+        // #endregion
       });
       notePartnerAudioPlaying();
+      // #region agent log
+      debugEchoLog("A", "SessionClient.tsx:playPcmChunk", "partner audio chunk", {
+        base64Chars: base64.length,
+      });
+      // #endregion
     },
-    [ensurePlayer, notePartnerAudioPlaying],
+    [debugEchoLog, ensurePlayer, notePartnerAudioPlaying],
   );
 
   const clearUserTurnFlushTimer = useCallback(() => {
@@ -448,11 +570,16 @@ export function SessionClient({
       // Ignore noise captions; keep any good text already in the bubble.
       if (!isDisplayableLearnerTranscript(cleaned)) return;
 
-      // Extra guard: caption matches what the partner just said.
-      if (
-        lastPartnerLineRef.current &&
-        isNearDuplicateUtterance(cleaned, lastPartnerLineRef.current)
-      ) {
+      // Extra guard: caption matches what the partner just said / is saying.
+      if (isLikelyPartnerEchoCaption(cleaned)) {
+        // #region agent log
+        debugEchoLog("D", "SessionClient.tsx:applyUserCaption", "drop echo caption", {
+          textPreview: cleaned.slice(0, 40),
+          partnerPreview: (
+            partnerBufRef.current || lastPartnerLineRef.current
+          ).slice(0, 40),
+        });
+        // #endregion
         return;
       }
 
@@ -493,8 +620,10 @@ export function SessionClient({
     },
     [
       clearUserTurnFlushTimer,
+      debugEchoLog,
       flushPartnerTurn,
       flushPlayback,
+      isLikelyPartnerEchoCaption,
       isPartnerAudioBlockingMic,
       upsertStreaming,
     ],
@@ -503,28 +632,157 @@ export function SessionClient({
   const startMic = useCallback(
     async (sessionId: string, sendAudio: (base64Pcm: string) => void) => {
       stopMic();
+      // #region agent log
+      let lastMicSendAllowed: boolean | null = null;
+      let lastMicDropLogAt = 0;
+      let lastMicSendLogAt = 0;
+      // #endregion
       micRef.current = await startMicCapture({
         sendAudio,
         isActive: () => sessionIdRef.current === sessionId,
-        // Don't upload speaker bleed while the partner is talking.
-        shouldSend: () =>
-          sessionIdRef.current === sessionId && !isPartnerAudioBlockingMic(),
+        // Don't upload speaker bleed while the partner is talking / just finished.
+        shouldSend: (rms) => {
+          if (sessionIdRef.current !== sessionId) return false;
+          if (isPartnerAudioBlockingMic()) {
+            // #region agent log
+            const allow = false;
+            const now = Date.now();
+            if (lastMicSendAllowed !== allow) {
+              lastMicSendAllowed = allow;
+              debugEchoLog(
+                "A",
+                "SessionClient.tsx:shouldSend",
+                "mic uplink muted",
+                { allow, rms },
+              );
+            } else if (now - lastMicDropLogAt > 800) {
+              lastMicDropLogAt = now;
+              debugEchoLog(
+                "A",
+                "SessionClient.tsx:shouldSend",
+                "mic still muted",
+                { allow, rms },
+              );
+            }
+            // #endregion
+            return false;
+          }
+          if (performance.now() < postPartnerMicGateUntilRef.current) {
+            const allow = rms >= POST_PARTNER_SPEAK_RMS;
+            // #region agent log
+            const now = Date.now();
+            if (lastMicSendAllowed !== allow) {
+              lastMicSendAllowed = allow;
+              debugEchoLog(
+                "B",
+                "SessionClient.tsx:shouldSend",
+                allow ? "mic gate open (energy)" : "mic gate closed (quiet)",
+                { allow, rms },
+              );
+            } else if (!allow && now - lastMicDropLogAt > 800) {
+              lastMicDropLogAt = now;
+              debugEchoLog(
+                "B",
+                "SessionClient.tsx:shouldSend",
+                "mic gate still closed",
+                { allow, rms },
+              );
+            }
+            // #endregion
+            return allow;
+          }
+          // #region agent log
+          const allow = true;
+          const now = Date.now();
+          if (lastMicSendAllowed !== allow) {
+            lastMicSendAllowed = allow;
+            debugEchoLog(
+              "A",
+              "SessionClient.tsx:shouldSend",
+              "mic uplink unmuted",
+              { allow, rms },
+            );
+          } else if (now - lastMicSendLogAt > 1500) {
+            lastMicSendLogAt = now;
+            debugEchoLog("B", "SessionClient.tsx:shouldSend", "mic sending", {
+              allow,
+              rms,
+            });
+          }
+          // #endregion
+          return true;
+        },
       });
       // Instant captions while speaking — Live ASR often arrives only at turn end.
+      // Keep browser ASR isActive tied to the session only (not partner mute).
+      // Partner mute / echo filters run in onUpdate; gating isActive on mute
+      // prevented Chrome from restarting after partner speech (no interim captions).
       liveUserAsrRef.current = false;
       browserAsrRef.current = startBrowserAsr({
         lang: "ko-KR",
-        isActive: () =>
-          sessionIdRef.current === sessionId && !isPartnerAudioBlockingMic(),
+        isActive: () => sessionIdRef.current === sessionId,
         onUpdate: (text) => {
           if (sessionIdRef.current !== sessionId) return;
           if (liveUserAsrRef.current) return;
-          if (isPartnerAudioBlockingMic()) return;
+          if (isPartnerAudioBlockingMic()) {
+            // #region agent log
+            debugEchoLog(
+              "E",
+              "SessionClient.tsx:browserAsr",
+              "drop browser asr (partner mute)",
+              {
+                blocked: true,
+                textLen: text.length,
+                textPreview: text.slice(0, 40),
+                partnerPreview: partnerBufRef.current.slice(0, 40),
+              },
+            );
+            // #endregion
+            return;
+          }
+          if (isLikelyPartnerEchoCaption(text)) {
+            // #region agent log
+            debugEchoLog(
+              "E",
+              "SessionClient.tsx:browserAsr",
+              "drop browser asr (echo)",
+              {
+                blocked: true,
+                textLen: text.length,
+                textPreview: text.slice(0, 40),
+                partnerPreview: (
+                  partnerBufRef.current || lastPartnerLineRef.current
+                ).slice(0, 40),
+              },
+            );
+            // #endregion
+            browserAsrRef.current?.resetTurn();
+            return;
+          }
+          // #region agent log
+          debugEchoLog(
+            "E",
+            "SessionClient.tsx:browserAsr",
+            "accept browser asr",
+            {
+              blocked: false,
+              textLen: text.length,
+              textPreview: text.slice(0, 40),
+              partnerPreview: partnerBufRef.current.slice(0, 40),
+            },
+          );
+          // #endregion
           applyUserCaption(text, "replace");
         },
       });
     },
-    [applyUserCaption, isPartnerAudioBlockingMic, stopMic],
+    [
+      applyUserCaption,
+      debugEchoLog,
+      isLikelyPartnerEchoCaption,
+      isPartnerAudioBlockingMic,
+      stopMic,
+    ],
   );
 
   const cleanupSession = useCallback(() => {
@@ -610,28 +868,42 @@ export function SessionClient({
         return;
       }
       if (event.type === "input_transcription") {
-        // Ignore echo ASR while partner audio is on speakers.
-        if (isPartnerAudioBlockingMic()) return;
-        // Live ASR is authoritative, but keep the browser preview on screen until
-        // Live text arrives — wiping here made users think nothing was heard.
+        // Ignore echo ASR while partner audio is on speakers / delayed bleed.
+        const blocked = shouldIgnoreLiveInputAsr(event.text);
+        // #region agent log
+        debugEchoLog(
+          "D",
+          "SessionClient.tsx:input_transcription",
+          blocked ? "drop live user asr (echo guard)" : "accept live user asr",
+          {
+            blocked,
+            mode: event.mode,
+            textLen: event.text.length,
+            textPreview: event.text.slice(0, 40),
+            partnerPreview: (
+              partnerBufRef.current || lastPartnerLineRef.current
+            ).slice(0, 40),
+            echo:
+              isLikelyPartnerEchoCaption(event.text) ||
+              looksLikeEchoOfPartner(
+                event.text,
+                lastPartnerLineRef.current,
+              ),
+          },
+        );
+        // #endregion
+        if (blocked) return;
+        // First Live chunk: merge with browser preview instead of wiping a
+        // better Chrome caption with a short/wrong Live guess.
         if (!liveUserAsrRef.current) {
           liveUserAsrRef.current = true;
           const preview = userBufRef.current;
           const liveText = sanitizeLearnerTranscript(event.text);
-          if (
-            preview &&
-            liveText &&
-            (isNearDuplicateUtterance(preview, liveText) ||
-              isTranscriptContinuation(preview, liveText) ||
-              isTranscriptContinuation(liveText, preview))
-          ) {
-            applyUserCaption(
-              liveText.length >= preview.length ? liveText : preview,
-              "replace",
-            );
+          if (preview && liveText) {
+            applyUserCaption(preferLearnerCaption(preview, liveText), "replace");
             return;
           }
-          // Fresh Live deltas that aren't the same line — start from Live text.
+          // No preview yet — append deltas start clean; replace uses Live text.
           if (event.mode === "append" && liveText) {
             userBufRef.current = "";
           }
@@ -664,14 +936,17 @@ export function SessionClient({
       applyUserCaption,
       clearPartnerTurnFlushTimer,
       clearUserTurnFlushTimer,
+      debugEchoLog,
       flushPartnerTurn,
       flushPlayback,
       flushUserTurn,
+      isLikelyPartnerEchoCaption,
       isPartnerAudioBlockingMic,
       playPcmChunk,
       reopenPartnerIfContinuation,
       schedulePartnerTurnFlush,
       scheduleUserTurnFlush,
+      shouldIgnoreLiveInputAsr,
       stopMic,
       upsertStreaming,
     ],

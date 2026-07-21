@@ -9,48 +9,17 @@ import {
   type RequireUserOk,
 } from "@/lib/auth/requireUser";
 import {
-  createPracticeSession,
-  endPracticeSession,
-} from "@/lib/db/practice";
-import {
-  closeLiveBridge,
-  createLiveBridgeSession,
-  sendLiveAudio,
-  subscribeLiveBridge,
-} from "@/lib/live/bridge";
-import type { LiveBridgeEvent } from "@/lib/live/types";
-import { takeToken } from "@/lib/rateLimit";
-import { getScenario, scenarioById } from "@/lib/scenarios";
+  cleanupLivePracticeSession,
+  forwardLiveAudio,
+  parseLiveClientMessage,
+  startLivePracticeSession,
+  type LiveServerMessage,
+} from "@/lib/live/sessionProtocol";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 /** Keep the Live socket alive for a practice turn (Fluid / Pro limits apply). */
 export const maxDuration = 300;
-
-const LIVE_CREATE_LIMIT = 8;
-const LIVE_CREATE_WINDOW_MS = 60_000;
-const MAX_AUDIO_B64_CHARS = 64_000;
-const AUDIO_RATE_LIMIT = 120;
-const AUDIO_RATE_WINDOW_MS = 10_000;
-
-type ClientMessage =
-  | { type: "start"; scenarioId?: string }
-  | { type: "audio"; audio: string }
-  | { type: "end" };
-
-type ServerMessage =
-  | {
-      type: "ready";
-      sessionId: string;
-      practiceSessionId: string;
-      model: string;
-      scenarioId: string;
-      starterLine: string;
-      titleKo: string;
-      titleEn: string;
-    }
-  | LiveBridgeEvent
-  | { type: "error"; message: string };
 
 /**
  * Bidirectional Live transport for Vercel Fluid.
@@ -70,12 +39,12 @@ export async function GET() {
   } catch (err) {
     const message =
       err instanceof Error ? err.message : "WebSocket upgrade unavailable";
-    // Local `next dev` / `next start` lack the Vercel upgrade hook — use HTTP Live.
+    // Local `next dev` / `next start` lack the Vercel upgrade hook.
     if (message.includes("not available in the current runtime")) {
       return NextResponse.json(
         {
           error:
-            "WebSocket Live needs Vercel Fluid. Locally use the HTTP Live routes.",
+            "WebSocket Live needs the Vercel runtime. Run `npm run dev:vercel`, not `npm run dev`.",
         },
         { status: 501 },
       );
@@ -94,7 +63,7 @@ async function attachLiveSocket(ws: WebSocket, auth: RequireUserOk) {
   let started = false;
   let closing = false;
 
-  const send = (msg: ServerMessage) => {
+  const send = (msg: LiveServerMessage) => {
     if (ws.readyState !== ws.OPEN) return;
     try {
       ws.send(JSON.stringify(msg));
@@ -106,40 +75,40 @@ async function attachLiveSocket(ws: WebSocket, auth: RequireUserOk) {
   const cleanup = async () => {
     if (closing) return;
     closing = true;
-    unsub?.();
-    unsub = undefined;
     const id = liveSessionId;
+    const sub = unsub;
     liveSessionId = null;
-    if (id) {
-      closeLiveBridge(id, auth.user.id);
-      try {
-        await endPracticeSession(auth.supabase, {
-          userId: auth.user.id,
-          liveSessionId: id,
-        });
-      } catch (err) {
-        console.error("[live/ws] end practice", err);
-      }
+    unsub = undefined;
+    await cleanupLivePracticeSession(auth, id, sub, "[live/ws]");
+  };
+
+  const closeSocket = (code = 1000) => {
+    try {
+      ws.close(code);
+    } catch {
+      /* ignore */
     }
   };
 
   ws.on("message", (raw) => {
     void (async () => {
-      let msg: ClientMessage;
+      let parsed: unknown;
       try {
-        msg = JSON.parse(String(raw)) as ClientMessage;
+        parsed = JSON.parse(String(raw)) as unknown;
       } catch {
+        send({ type: "error", message: "Invalid message" });
+        return;
+      }
+
+      const msg = parseLiveClientMessage(parsed);
+      if (!msg) {
         send({ type: "error", message: "Invalid message" });
         return;
       }
 
       if (msg.type === "end") {
         await cleanup();
-        try {
-          ws.close(1000);
-        } catch {
-          /* ignore */
-        }
+        closeSocket(1000);
         return;
       }
 
@@ -147,106 +116,26 @@ async function attachLiveSocket(ws: WebSocket, auth: RequireUserOk) {
         if (started) return;
         started = true;
 
-        if (
-          !takeToken(
-            `live-create:${auth.user.id}`,
-            LIVE_CREATE_LIMIT,
-            LIVE_CREATE_WINDOW_MS,
-          )
-        ) {
-          send({
-            type: "error",
-            message: "Too many Live sessions — try again shortly",
-          });
-          ws.close(1013);
-          return;
-        }
+        const result = await startLivePracticeSession(auth, msg.scenarioId, {
+          logPrefix: "[live/ws]",
+          send,
+          setSession: (sessionId, nextUnsub) => {
+            liveSessionId = sessionId;
+            unsub = nextUnsub;
+          },
+          onBridgeClosed: () => {
+            void cleanup().then(() => closeSocket(1000));
+          },
+        });
 
-        const scenarioId = msg.scenarioId?.trim() || undefined;
-        if (scenarioId && !scenarioById[scenarioId]) {
-          send({ type: "error", message: "Unknown scenario" });
-          ws.close(1008);
-          return;
-        }
-
-        try {
-          const scenario = getScenario(scenarioId);
-          const { sessionId, model } = await createLiveBridgeSession(
-            auth.user.id,
-            scenario.id,
-          );
-          liveSessionId = sessionId;
-
-          const practiceSessionId = await createPracticeSession(auth.supabase, {
-            userId: auth.user.id,
-            liveSessionId: sessionId,
-            scenarioId: scenario.id,
-            titleKo: scenario.titleKo,
-            titleEn: scenario.titleEn,
-          });
-
-          unsub = subscribeLiveBridge(
-            sessionId,
-            (event) => {
-              send(event);
-              if (event.type === "closed") {
-                void cleanup().then(() => {
-                  try {
-                    ws.close(1000);
-                  } catch {
-                    /* ignore */
-                  }
-                });
-              }
-            },
-            auth.user.id,
-          );
-
-          send({
-            type: "ready",
-            sessionId,
-            practiceSessionId,
-            model,
-            scenarioId: scenario.id,
-            starterLine: scenario.starterLine,
-            titleKo: scenario.titleKo,
-            titleEn: scenario.titleEn,
-          });
-        } catch (err) {
-          console.error("[live/ws] start", err);
-          if (liveSessionId) {
-            closeLiveBridge(liveSessionId, auth.user.id);
-            liveSessionId = null;
-          }
-          send({ type: "error", message: "Failed to start Live session" });
-          try {
-            ws.close(1011);
-          } catch {
-            /* ignore */
-          }
-        }
+        if (result === "rate_limited") closeSocket(1013);
+        else if (result === "bad_scenario") closeSocket(1008);
+        else if (result === "failed") closeSocket(1011);
         return;
       }
 
       if (msg.type === "audio") {
-        if (!liveSessionId) return;
-        if (typeof msg.audio !== "string" || !msg.audio) return;
-        if (msg.audio.length > MAX_AUDIO_B64_CHARS) return;
-        if (!/^[A-Za-z0-9+/]+=*$/.test(msg.audio)) return;
-        if (
-          !takeToken(
-            `live-audio:${auth.user.id}:${liveSessionId}`,
-            AUDIO_RATE_LIMIT,
-            AUDIO_RATE_WINDOW_MS,
-          )
-        ) {
-          return;
-        }
-        try {
-          sendLiveAudio(liveSessionId, msg.audio, auth.user.id);
-        } catch {
-          send({ type: "error", message: "Live session not found" });
-        }
+        forwardLiveAudio(auth, liveSessionId, msg.audio, send);
       }
     })();
   });

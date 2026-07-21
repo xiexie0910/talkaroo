@@ -13,12 +13,13 @@ import { getScenario, LIVE_MODEL, scenarioById } from "@/lib/scenarios";
 
 /**
  * How long silence before Live commits end-of-speech.
- * Vertex Live accepts 0–2000ms. Lower = snappier partner replies;
- * raise via GEMINI_LIVE_SILENCE_MS if learners get cut off mid-thought.
+ * Vertex Live accepts 0–2000ms. Docs recommend ~500–800ms for ASR quality;
+ * L2 learners pause mid-thought, so default slightly above that.
+ * Raise via GEMINI_LIVE_SILENCE_MS if speech is still cut short.
  */
 const SILENCE_DURATION_MS = (() => {
-  const raw = Number(process.env.GEMINI_LIVE_SILENCE_MS?.trim() || "900");
-  if (!Number.isFinite(raw)) return 900;
+  const raw = Number(process.env.GEMINI_LIVE_SILENCE_MS?.trim() || "1100");
+  if (!Number.isFinite(raw)) return 1100;
   return Math.min(2000, Math.max(200, raw));
 })();
 
@@ -28,8 +29,8 @@ const SILENCE_DURATION_MS = (() => {
  * Keep moderate so quiet speech and short replies ("네") still work.
  */
 const PREFIX_PADDING_MS = (() => {
-  const raw = Number(process.env.GEMINI_LIVE_PREFIX_PADDING_MS?.trim() || "160");
-  if (!Number.isFinite(raw)) return 160;
+  const raw = Number(process.env.GEMINI_LIVE_PREFIX_PADDING_MS?.trim() || "200");
+  if (!Number.isFinite(raw)) return 200;
   return Math.min(1000, Math.max(20, raw));
 })();
 
@@ -41,6 +42,30 @@ const START_OF_SPEECH =
   process.env.GEMINI_LIVE_START_SENSITIVITY?.trim().toLowerCase() === "high"
     ? StartSensitivity.START_SENSITIVITY_HIGH
     : StartSensitivity.START_SENSITIVITY_LOW;
+
+/**
+ * LOW = less eager end-of-speech (keeps mid-sentence pauses in one turn).
+ * HIGH fragments utterances → weaker Live ASR. Override with
+ * GEMINI_LIVE_END_SENSITIVITY=high for snappier barge-in.
+ */
+const END_OF_SPEECH =
+  process.env.GEMINI_LIVE_END_SENSITIVITY?.trim().toLowerCase() === "high"
+    ? EndSensitivity.END_SENSITIVITY_HIGH
+    : EndSensitivity.END_SENSITIVITY_LOW;
+
+/** Bias Live ASR toward common learner Korean (speech adaptation). */
+const INPUT_ASR_ADAPTATION = [
+  "안녕하세요",
+  "네",
+  "아니요",
+  "주세요",
+  "감사합니다",
+  "아메리카노",
+  "아이스 아메리카노",
+  "한 잔",
+  "얼마예요",
+  "도와주세요",
+] as const;
 
 /** Idle Live sockets are closed so abandoned tabs don't burn Vertex quota. */
 const SESSION_TTL_MS = 30 * 60_000;
@@ -61,16 +86,24 @@ type StoredSession = {
   lastActivityAt: number;
 };
 
-const globalForLive = globalThis as unknown as {
-  __talkarooLiveSessions?: Map<string, StoredSession>;
-  __talkarooLiveReaper?: ReturnType<typeof setInterval>;
+const LIVE_SESSIONS_KEY = Symbol.for("talkaroo.liveSessions.v1");
+const LIVE_REAPER_KEY = Symbol.for("talkaroo.liveReaper.v1");
+
+type LiveGlobals = typeof globalThis & {
+  [LIVE_SESSIONS_KEY]?: Map<string, StoredSession>;
+  [LIVE_REAPER_KEY]?: ReturnType<typeof setInterval>;
 };
 
+function liveGlobals(): LiveGlobals {
+  return globalThis as LiveGlobals;
+}
+
 function sessions(): Map<string, StoredSession> {
-  if (!globalForLive.__talkarooLiveSessions) {
-    globalForLive.__talkarooLiveSessions = new Map();
+  const g = liveGlobals();
+  if (!g[LIVE_SESSIONS_KEY]) {
+    g[LIVE_SESSIONS_KEY] = new Map();
   }
-  return globalForLive.__talkarooLiveSessions;
+  return g[LIVE_SESSIONS_KEY]!;
 }
 
 function touch(stored: StoredSession) {
@@ -98,13 +131,11 @@ export function reapStaleLiveSessions(now = Date.now()) {
 }
 
 function ensureReaper() {
-  if (globalForLive.__talkarooLiveReaper) return;
-  globalForLive.__talkarooLiveReaper = setInterval(
-    () => reapStaleLiveSessions(),
-    60_000,
-  );
+  const g = liveGlobals();
+  if (g[LIVE_REAPER_KEY]) return;
+  g[LIVE_REAPER_KEY] = setInterval(() => reapStaleLiveSessions(), 60_000);
   // Don't keep the process alive solely for the reaper in Node.
-  globalForLive.__talkarooLiveReaper.unref?.();
+  g[LIVE_REAPER_KEY].unref?.();
 }
 
 function emit(stored: StoredSession, event: LiveBridgeEvent) {
@@ -154,19 +185,20 @@ export async function createLiveBridgeSession(
     config: {
       responseModalities: [Modality.AUDIO],
       systemInstruction: scenario.systemInstruction,
-      // Bias ASR toward Korean — practice sessions are Hangul-first.
+      // Prefer Korean; allow English so clear English isn't forced into Hangul.
       inputAudioTranscription: {
-        languageHints: { languageCodes: ["ko-KR"] },
+        languageHints: { languageCodes: ["ko-KR", "en-US"] },
+        adaptationPhrases: [...INPUT_ASR_ADAPTATION],
       },
       outputAudioTranscription: {
         languageHints: { languageCodes: ["ko-KR"] },
       },
-      // LOW start + modest prefixPadding: less click/"음" noise than HIGH/20ms,
-      // without the aggressive client gate that was dropping real speech.
+      // LOW start + LOW end: fewer noise starts, fewer mid-thought cutoffs
+      // (fragmented turns hurt Live input transcription quality).
       realtimeInputConfig: {
         automaticActivityDetection: {
           startOfSpeechSensitivity: START_OF_SPEECH,
-          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+          endOfSpeechSensitivity: END_OF_SPEECH,
           prefixPaddingMs: PREFIX_PADDING_MS,
           silenceDurationMs: SILENCE_DURATION_MS,
         },
@@ -208,9 +240,12 @@ export async function createLiveBridgeSession(
             mode: "replace",
           });
         }
-        // Input transcription: unfinished = cumulative interim; finished/omitted = delta.
+        // Input transcription: unfinished = cumulative interim (replace).
+        // finished/omitted: often a short delta, sometimes a cumulative final —
+        // client mergeTranscriptChunk handles both.
         if (sc.inputTranscription?.text) {
-          const interim = sc.inputTranscription.finished === false;
+          const finished = sc.inputTranscription.finished;
+          const interim = finished === false;
           emit(stored, {
             type: "input_transcription",
             text: sc.inputTranscription.text,
@@ -325,9 +360,10 @@ export function __resetLiveBridgeForTests() {
     }
   }
   sessions().clear();
-  if (globalForLive.__talkarooLiveReaper) {
-    clearInterval(globalForLive.__talkarooLiveReaper);
-    globalForLive.__talkarooLiveReaper = undefined;
+  const g = liveGlobals();
+  if (g[LIVE_REAPER_KEY]) {
+    clearInterval(g[LIVE_REAPER_KEY]);
+    g[LIVE_REAPER_KEY] = undefined;
   }
 }
 

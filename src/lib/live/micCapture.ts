@@ -1,12 +1,13 @@
 /**
- * Captures mic PCM at 16 kHz and sends batched base64 frames to Live.
+ * Captures mic PCM and sends batched base64 frames to Live at 16 kHz.
  * Batching cuts spam vs one send per ScriptProcessor callback.
  * Noise filtering is handled by Live VAD (start sensitivity + prefix padding).
+ * Resamples when the browser AudioContext cannot run at 16 kHz.
  */
 import {
   LIVE_INPUT_RATE,
   arrayBufferToBase64,
-  floatTo16BitPCM,
+  floatToLiveInputPcm,
 } from "@/lib/live/audio";
 
 /** Smaller batches = snappier Live ASR; still avoids one send per audio callback. */
@@ -14,6 +15,8 @@ const BATCH_MS = 60;
 
 export type MicCapture = {
   stop: () => void;
+  /** Rolling RMS of the latest mic callback (0–1-ish). */
+  inputRms: () => number;
 };
 
 type Options = {
@@ -24,8 +27,9 @@ type Options = {
   /**
    * Return false to mute uplink (e.g. while partner audio plays through
    * speakers — otherwise the mic hears the partner and ASR attributes it to you).
+   * Receives the latest mic RMS so callers can require speech energy.
    */
-  shouldSend?: () => boolean;
+  shouldSend?: (rms: number) => boolean;
 };
 
 export async function startMicCapture(options: Options): Promise<MicCapture> {
@@ -39,18 +43,21 @@ export async function startMicCapture(options: Options): Promise<MicCapture> {
     },
   });
 
+  // Prefer 16 kHz; many browsers ignore this and stay at 44.1/48 kHz.
   const ctx = new AudioContext({ sampleRate: LIVE_INPUT_RATE });
   if (ctx.state === "suspended") await ctx.resume();
+  const sourceRate = ctx.sampleRate;
 
   const source = ctx.createMediaStreamSource(stream);
   const processor = ctx.createScriptProcessor(4096, 1, 1);
   const pending: ArrayBuffer[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let stopped = false;
+  let lastRms = 0;
 
   const postBatch = (chunks: ArrayBuffer[]) => {
     if (!chunks.length || !isActive()) return;
-    if (shouldSend && !shouldSend()) return;
+    if (shouldSend && !shouldSend(lastRms)) return;
     const total = chunks.reduce((n, c) => n + c.byteLength, 0);
     const merged = new Uint8Array(total);
     let offset = 0;
@@ -68,7 +75,7 @@ export async function startMicCapture(options: Options): Promise<MicCapture> {
   const flushPending = () => {
     flushTimer = null;
     if (!pending.length) return;
-    if (shouldSend && !shouldSend()) {
+    if (shouldSend && !shouldSend(lastRms)) {
       pending.length = 0;
       return;
     }
@@ -78,7 +85,12 @@ export async function startMicCapture(options: Options): Promise<MicCapture> {
 
   processor.onaudioprocess = (ev) => {
     if (stopped || !isActive()) return;
-    if (shouldSend && !shouldSend()) {
+    const input = ev.inputBuffer.getChannelData(0);
+    let sum = 0;
+    for (let i = 0; i < input.length; i++) sum += input[i]! * input[i]!;
+    lastRms = Math.sqrt(sum / input.length);
+
+    if (shouldSend && !shouldSend(lastRms)) {
       // Drop speaker-echo frames; don't let them queue for later send.
       pending.length = 0;
       if (flushTimer) {
@@ -87,7 +99,7 @@ export async function startMicCapture(options: Options): Promise<MicCapture> {
       }
       return;
     }
-    pending.push(floatTo16BitPCM(ev.inputBuffer.getChannelData(0)));
+    pending.push(floatToLiveInputPcm(input, sourceRate));
     if (!flushTimer) {
       flushTimer = setTimeout(flushPending, BATCH_MS);
     }
@@ -100,6 +112,7 @@ export async function startMicCapture(options: Options): Promise<MicCapture> {
   mute.connect(ctx.destination);
 
   return {
+    inputRms: () => lastRms,
     stop: () => {
       stopped = true;
       if (flushTimer) {

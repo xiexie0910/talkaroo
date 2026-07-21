@@ -7,6 +7,7 @@ import {
   fixturePartnerAssist,
 } from "@/lib/coach/fixtures";
 import {
+  normalizeCoachPayload,
   parseCoachResponse,
   safeParseCoachResponse,
 } from "@/lib/coach/schema";
@@ -57,6 +58,28 @@ describe("coach schema", () => {
     expect(parsed.mode).toBe("learner_improve");
     if (parsed.mode === "learner_improve") {
       expect(parsed.natural_ko).toBe("");
+    }
+  });
+
+  it("clamps oversized tips_en before parse", () => {
+    const longTip = "x".repeat(260);
+    const result = safeParseCoachResponse(
+      normalizeCoachPayload({
+        mode: "learner_improve",
+        user_sentence: "없어요.",
+        heard_as_ko: "없어요.",
+        meant_en: "I don't have any.",
+        natural_ko: "없어요.",
+        natural_en: "I don't have any.",
+        formality: "haeyo",
+        formality_fit: "fits",
+        tips_en: [longTip],
+        was_already_natural: true,
+      }),
+    );
+    expect(result.success).toBe(true);
+    if (result.success && result.data.mode === "learner_improve") {
+      expect(result.data.tips_en[0]!.length).toBeLessThanOrEqual(200);
     }
   });
 

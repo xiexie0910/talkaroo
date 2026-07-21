@@ -14,6 +14,11 @@ const MAX_AUDIO_B64_CHARS = 64_000;
 const AUDIO_RATE_LIMIT = 120;
 const AUDIO_RATE_WINDOW_MS = 10_000;
 
+/**
+ * Legacy mic uplink for split HTTP Live.
+ * Prefer `/api/live/ws` (production) or `/api/live/stream` (local duplex).
+ * This route 404s when the Live session lives on another isolate/instance.
+ */
 export async function POST(req: Request, { params }: Params) {
   const auth = await requireUser();
   if (isRequireUserError(auth)) return auth.error;
@@ -41,7 +46,6 @@ export async function POST(req: Request, { params }: Params) {
     if (body.audio.length > MAX_AUDIO_B64_CHARS) {
       return NextResponse.json({ error: "audio too large" }, { status: 413 });
     }
-    // Base64 alphabet only — reject garbage that would blow decode buffers.
     if (!/^[A-Za-z0-9+/]+=*$/.test(body.audio)) {
       return NextResponse.json({ error: "invalid audio encoding" }, { status: 400 });
     }
@@ -49,6 +53,19 @@ export async function POST(req: Request, { params }: Params) {
     sendLiveAudio(id, body.audio, auth.user.id);
     return NextResponse.json({ ok: true });
   } catch {
-    return NextResponse.json({ error: "Live session not found" }, { status: 404 });
+    // Typical on Vercel multi-instance or Next.js dev isolates — session Map
+    // is process-local and this request hit a different worker.
+    console.warn(
+      "[live/audio] session not on this instance — client should use /api/live/ws or /api/live/stream",
+      { sessionId: id, userId: auth.user.id },
+    );
+    return NextResponse.json(
+      {
+        error: "Live session not found on this instance",
+        code: "LIVE_SESSION_MISROUTED",
+        hint: "Use WebSocket (/api/live/ws) or duplex stream (/api/live/stream)",
+      },
+      { status: 404 },
+    );
   }
 }

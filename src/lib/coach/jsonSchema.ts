@@ -1,4 +1,9 @@
 /** JSON Schema for Gemini coach structured output (Learning HUD). */
+import {
+  COACH_NOTE_MAX_CHARS,
+  COACH_TIP_MAX_CHARS,
+  COACH_TIPS_MAX_ITEMS,
+} from "@/lib/coach/schema";
 
 export const partnerAssistJsonSchema = {
   type: "object",
@@ -24,7 +29,7 @@ export const partnerAssistJsonSchema = {
         properties: {
           surface: { type: "string", minLength: 1 },
           meaning_en: { type: "string", minLength: 1 },
-          note: { type: "string", maxLength: 80 },
+          note: { type: "string", maxLength: COACH_NOTE_MAX_CHARS },
         },
       },
     },
@@ -38,7 +43,7 @@ export const partnerAssistJsonSchema = {
         properties: {
           ko: { type: "string", minLength: 1 },
           en: { type: "string", minLength: 1 },
-          pattern: { type: "string", maxLength: 80 },
+          pattern: { type: "string", maxLength: COACH_NOTE_MAX_CHARS },
         },
       },
     },
@@ -77,8 +82,12 @@ export const learnerImproveJsonSchema = {
     },
     tips_en: {
       type: "array",
-      maxItems: 4,
-      items: { type: "string", minLength: 1, maxLength: 200 },
+      maxItems: COACH_TIPS_MAX_ITEMS,
+      items: {
+        type: "string",
+        minLength: 1,
+        maxLength: COACH_TIP_MAX_CHARS,
+      },
     },
     was_already_natural: { type: "boolean" },
   },

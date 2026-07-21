@@ -1,9 +1,14 @@
 /** Hangul syllables (가–힣). */
 const HANGUL_RE = /[\uAC00-\uD7A3]/;
+const HANGUL_GLOBAL_RE = /[\uAC00-\uD7A3]/g;
 
 /** True if the string contains at least one Hangul syllable. */
 export function hasHangul(text: string): boolean {
   return HANGUL_RE.test(text);
+}
+
+function hangulCount(text: string): number {
+  return (text.match(HANGUL_GLOBAL_RE) ?? []).length;
 }
 
 /**
@@ -90,6 +95,69 @@ export function isTranscriptContinuation(
 }
 
 /**
+ * True when learner ASR is likely speaker-bleed of the partner (no headphones).
+ * Stricter than near-duplicate so short shared words (e.g. "영화") don't match.
+ */
+export function looksLikeEchoOfPartner(
+  candidate: string,
+  partner: string,
+): boolean {
+  if (!partner.trim() || !candidate.trim()) return false;
+  if (isNearDuplicateUtterance(candidate, partner)) return true;
+  if (
+    isTranscriptContinuation(partner, candidate) ||
+    isTranscriptContinuation(candidate, partner)
+  ) {
+    return true;
+  }
+
+  const c = normalizeTranscript(sanitizeLearnerTranscript(candidate));
+  const p = normalizeTranscript(sanitizeLearnerTranscript(partner));
+  if (!c || !p) return false;
+
+  // Long fragment of the partner line heard through speakers.
+  if (c.length >= 6 && p.includes(c)) return true;
+  if (p.length >= 6 && c.includes(p)) return true;
+
+  const cSyl = c.match(HANGUL_GLOBAL_RE) ?? [];
+  const pSyl = p.match(HANGUL_GLOBAL_RE) ?? [];
+  if (cSyl.length < 6 || pSyl.length < 6) return false;
+  const partnerSet = new Set(pSyl);
+  const hits = cSyl.filter((s) => partnerSet.has(s)).length;
+  // Most of the candidate's Hangul already appeared in the partner line.
+  return hits >= 6 && hits / cSyl.length >= 0.65;
+}
+
+/**
+ * Pick the better learner caption when browser ASR and Live ASR disagree.
+ * Prefers related continuations / longer Hangul over short wrong guesses.
+ */
+export function preferLearnerCaption(a: string, b: string): string {
+  const left = sanitizeLearnerTranscript(a);
+  const right = sanitizeLearnerTranscript(b);
+  const leftOk = isDisplayableLearnerTranscript(left);
+  const rightOk = isDisplayableLearnerTranscript(right);
+  if (leftOk && !rightOk) return left;
+  if (rightOk && !leftOk) return right;
+  if (!leftOk && !rightOk) return left || right;
+
+  if (
+    isNearDuplicateUtterance(left, right) ||
+    isTranscriptContinuation(left, right) ||
+    isTranscriptContinuation(right, left)
+  ) {
+    return hangulCount(right) >= hangulCount(left) ? right : left;
+  }
+
+  // Unrelated: keep the fuller Hangul line (browser preview is often better
+  // than a short first Live delta).
+  const leftN = hangulCount(left);
+  const rightN = hangulCount(right);
+  if (rightN !== leftN) return rightN > leftN ? right : left;
+  return right.length >= left.length ? right : left;
+}
+
+/**
  * Merge Live ASR chunks. Interim snapshots replace; committed chunks may be
  * deltas or cumulative — avoid duplicating when both arrive.
  */
@@ -108,6 +176,10 @@ export function mergeTranscriptChunk(
     return incoming.trim().length >= previous.trim().length
       ? incoming
       : previous;
+  }
+  // Appended chunk that looks like a corrected re-ASR of the same line.
+  if (isNearDuplicateUtterance(previous, incoming)) {
+    return hangulCount(incoming) >= hangulCount(previous) ? incoming : previous;
   }
   return previous + incoming;
 }

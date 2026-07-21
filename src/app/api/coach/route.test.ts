@@ -140,6 +140,41 @@ describe("POST /api/coach", () => {
     expect(mockGenerateContent).not.toHaveBeenCalled();
   });
 
+  it("clamps oversized tips instead of failing schema validation", async () => {
+    process.env.GOOGLE_CLOUD_PROJECT = "test-project";
+    mockGenerateContent.mockResolvedValue({
+      text: JSON.stringify({
+        mode: "learner_improve",
+        user_sentence: "없어요.",
+        heard_as_ko: "없어요.",
+        meant_en: "I don't have any.",
+        natural_ko: "없어요.",
+        natural_en: "I don't have any.",
+        formality: "haeyo",
+        formality_fit: "fits",
+        tips_en: ["A".repeat(280)],
+        was_already_natural: true,
+      }),
+    });
+
+    const { POST } = await import("@/app/api/coach/route");
+    const res = await POST(
+      new Request("http://localhost/api/coach", {
+        method: "POST",
+        body: JSON.stringify({
+          mode: "learner_improve",
+          level: "beginner",
+          transcript: "없어요.",
+          turnId: "t-tip",
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const json = await res.json();
+    expect(json.tips_en[0].length).toBeLessThanOrEqual(200);
+    expect(json.error).toBeUndefined();
+  });
+
   it("rejects invalid mode", async () => {
     process.env.GOOGLE_CLOUD_PROJECT = "test-project";
     const { POST } = await import("@/app/api/coach/route");

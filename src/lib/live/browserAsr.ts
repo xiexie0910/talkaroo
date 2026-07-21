@@ -72,8 +72,16 @@ export function startBrowserAsr(options: Options): BrowserAsr | null {
   let committed = "";
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /** Join ASR pieces without gluing Hangul words when Chrome omits a space. */
+  const joinPiece = (left: string, right: string) => {
+    if (!left) return right;
+    if (!right) return left;
+    if (/\s$/.test(left) || /^\s/.test(right)) return left + right;
+    return `${left} ${right}`;
+  };
+
   const emit = (interim: string) => {
-    const text = `${committed}${interim}`.replace(/\s+/g, " ").trim();
+    const text = joinPiece(committed, interim).replace(/\s+/g, " ").trim();
     if (text) onUpdate(text);
   };
 
@@ -82,12 +90,12 @@ export function startBrowserAsr(options: Options): BrowserAsr | null {
     let interim = "";
     for (let i = ev.resultIndex; i < ev.results.length; i++) {
       const result = ev.results[i]!;
-      const piece = result[0]?.transcript ?? "";
+      const piece = (result[0]?.transcript ?? "").trim();
       if (!piece) continue;
       if (result.isFinal) {
-        committed = `${committed}${piece}`;
+        committed = joinPiece(committed, piece);
       } else {
-        interim += piece;
+        interim = joinPiece(interim, piece);
       }
     }
     emit(interim);
@@ -112,7 +120,7 @@ export function startBrowserAsr(options: Options): BrowserAsr | null {
       } catch {
         /* already started */
       }
-    }, 120);
+    }, 60);
   };
 
   try {

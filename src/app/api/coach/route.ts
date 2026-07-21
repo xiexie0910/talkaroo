@@ -6,6 +6,7 @@ import {
   coachRequestSchema,
   emptyLearnerImprove,
   emptyPartnerAssist,
+  normalizeCoachPayload,
   safeParseCoachResponse,
 } from "@/lib/coach/schema";
 import { coachJsonSchemaForMode } from "@/lib/coach/jsonSchema";
@@ -57,11 +58,11 @@ Thinking order:
 4. natural_en — short gloss of natural_ko
 5. formality — of THEIR line when clear, else of natural_ko: banmal | haeyo | hapsyo | mixed | unclear
 6. formality_fit — vs partner/scene: fits | too_casual | too_formal | n_a
-7. tips_en — 1 to 3 short English bullets. Each bullet = one distinct point. Cover as needed:
+7. tips_en — 1 to 3 short English bullets (EACH ≤160 characters). Each bullet = one distinct point. Cover as needed:
    - Meaning / context / ASR: if a word doesn't fit (wrong noun, wrong place name, odd reply), say what they probably meant and the better Korean (quote both).
    - Natural phrasing (particles, word choice, word order) — quote the awkward bit.
    - Formality once only (e.g. mixed 반말+해요체 → keep one level).
-   Do NOT repeat the same formality point in two bullets. No lectures, no "practice more".
+   Do NOT repeat the same formality point in two bullets. No lectures, no "practice more". Keep tips punchy.
 8. was_already_natural — true only if natural_ko ≈ heard_as_ko (tiny fixes only)
 
 Rules:
@@ -239,7 +240,7 @@ export async function POST(req: Request) {
         attempt > 0,
         controller.signal,
       );
-      const parsed = safeParseCoachResponse(raw);
+      const parsed = safeParseCoachResponse(normalizeCoachPayload(raw));
       if (parsed.success) {
         if (parsed.data.mode !== mode) {
           lastError = `Coach returned mode ${parsed.data.mode}, expected ${mode}`;
@@ -261,7 +262,8 @@ export async function POST(req: Request) {
           return NextResponse.json(parsed.data satisfies CoachApiResult);
         }
       } else {
-        lastError = parsed.error.message;
+        console.warn("[coach] schema", parsed.error.issues);
+        lastError = "Coach response was incomplete — tap Retry";
       }
     } catch (err) {
       const name = err instanceof Error ? err.name : "";

@@ -3,6 +3,46 @@
 export const LIVE_INPUT_RATE = 16_000 as const;
 export const LIVE_OUTPUT_RATE = 24_000 as const;
 
+/**
+ * Linear-resample float audio to a target rate.
+ * Browsers often ignore AudioContext({ sampleRate: 16000 }) and run at
+ * 44.1/48 kHz — sending that PCM labeled as 16 kHz wrecks Live ASR.
+ */
+export function resampleFloat32(
+  input: Float32Array,
+  fromRate: number,
+  toRate: number,
+): Float32Array {
+  if (fromRate === toRate || input.length === 0) return input;
+  if (!Number.isFinite(fromRate) || !Number.isFinite(toRate) || fromRate <= 0 || toRate <= 0) {
+    return input;
+  }
+  const ratio = fromRate / toRate;
+  const outLen = Math.max(1, Math.round(input.length / ratio));
+  const out = new Float32Array(outLen);
+  const last = input.length - 1;
+  for (let i = 0; i < outLen; i++) {
+    const src = i * ratio;
+    const i0 = Math.min(Math.floor(src), last);
+    const i1 = Math.min(i0 + 1, last);
+    const frac = src - i0;
+    out[i] = input[i0]! * (1 - frac) + input[i1]! * frac;
+  }
+  return out;
+}
+
+/** Convert mic floats to 16-bit PCM at LIVE_INPUT_RATE, resampling if needed. */
+export function floatToLiveInputPcm(
+  float32: Float32Array,
+  sourceSampleRate: number,
+): ArrayBuffer {
+  const samples =
+    sourceSampleRate === LIVE_INPUT_RATE
+      ? float32
+      : resampleFloat32(float32, sourceSampleRate, LIVE_INPUT_RATE);
+  return floatTo16BitPCM(samples);
+}
+
 export function floatTo16BitPCM(float32: Float32Array): ArrayBuffer {
   const buffer = new ArrayBuffer(float32.length * 2);
   const view = new DataView(buffer);

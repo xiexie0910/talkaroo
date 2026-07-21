@@ -5,7 +5,9 @@ import {
   isDisplayableLearnerTranscript,
   isNearDuplicateUtterance,
   isTranscriptContinuation,
+  looksLikeEchoOfPartner,
   mergeTranscriptChunk,
+  preferLearnerCaption,
   sanitizeLearnerTranscript,
 } from "@/lib/session/transcript";
 
@@ -73,6 +75,26 @@ describe("isNearDuplicateUtterance", () => {
   });
 });
 
+describe("looksLikeEchoOfPartner", () => {
+  it("flags near-duplicates of the partner line", () => {
+    expect(
+      looksLikeEchoOfPartner(
+        "요즘 무슨 재밌는 거 봐요 드라마나 영화 같은 거",
+        "요즘 무슨 재미있는 거 봐요? 드라마나 영화 같은 거?",
+      ),
+    ).toBe(true);
+  });
+
+  it("allows short replies that reuse a partner word", () => {
+    expect(
+      looksLikeEchoOfPartner(
+        "네, 영화요",
+        "요즘 무슨 재미있는 거 봐요? 드라마나 영화 같은 거?",
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("isTranscriptContinuation", () => {
   it("detects cumulative partner lines after an early seal", () => {
     expect(
@@ -87,6 +109,20 @@ describe("isTranscriptContinuation", () => {
   });
 });
 
+describe("preferLearnerCaption", () => {
+  it("keeps the fuller Hangul line when Live sends a short wrong guess", () => {
+    expect(
+      preferLearnerCaption("아이스 아메리카노 주세요", "아메리카노"),
+    ).toBe("아이스 아메리카노 주세요");
+  });
+
+  it("upgrades to a longer related Live final", () => {
+    expect(
+      preferLearnerCaption("아이스 아메리카노", "아이스 아메리카노 주세요"),
+    ).toBe("아이스 아메리카노 주세요");
+  });
+});
+
 describe("mergeTranscriptChunk", () => {
   it("replaces on interim snapshots", () => {
     expect(mergeTranscriptChunk("안", "안녕", "replace")).toBe("안녕");
@@ -96,6 +132,12 @@ describe("mergeTranscriptChunk", () => {
     expect(mergeTranscriptChunk("안녕", "하세요", "append")).toBe("안녕하세요");
     expect(mergeTranscriptChunk("안녕", "안녕하세요", "append")).toBe(
       "안녕하세요",
+    );
+  });
+
+  it("prefers the better near-duplicate on append", () => {
+    expect(mergeTranscriptChunk("없어요", "없어요요", "append")).toBe(
+      "없어요요",
     );
   });
 });
