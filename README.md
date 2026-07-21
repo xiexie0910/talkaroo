@@ -17,11 +17,26 @@ Practice a scene → speak Korean → tap **Understand** or **Polish** when you 
 | **Build agents** | **Codex** + **GPT-5.6** — used to design and ship the app (not called at runtime) |
 | **Codex Session ID** | _add `/feedback` ID from the primary build thread before submit_ |
 
-**How Codex + GPT-5.6 were used:** dual-channel architecture, session/landing UI, Live bridge, coach & recap APIs, ASR turn-taking, level affordances, and prompt-boundary hardening. Demo voiceover should cover the product plus how Codex and GPT-5.6 accelerated the build. No `OPENAI_API_KEY` in the product.
+Talkaroo does **not** call OpenAI models in production. There is no `OPENAI_API_KEY` in the product.
+
+### How Codex and GPT-5.6 were used
+
+**GPT-5.6** shaped the product:
+
+- Education-track thesis: practice for people *using* Korean in real life, not another flashcard wrapper
+- Dual-channel design — live partner stays immersive; coaching only appears on tap
+- Frontend and landing direction: session UI, level affordances, scroll narrative
+
+**Codex** shipped the working product:
+
+- Dual-channel architecture end to end: Live voice partner + on-tap coach/recap APIs
+- Browser → WebSocket bridge → Gemini Live (mic capture, PCM resampling, playback, turn-taking)
+- Session UI, ASR merge with Live captions, level-gated Understand / Polish
+- Prompt-boundary hardening, schemas, tests, and the thin loop: speak → hear → understand → polish → reflect
 
 ## Stack
 
-Next.js 16 · React 19 · Supabase · Vertex Gemini (`gemini-live-2.5-flash-native-audio` + `gemini-2.5-flash-lite`) · Zod · Vitest
+Next.js 16 · React 19 · Tailwind · Supabase · Vertex Gemini (`gemini-live-2.5-flash-native-audio` + `gemini-2.5-flash-lite`) · Zod · Vitest · Vercel
 
 ## How it works
 
@@ -31,4 +46,6 @@ On-tap → Gemini coach HUD
 End & reflect → short recap + next mission
 ```
 
-Coaching is **on tap by level** (Beginner: Understand + Polish; Intermediate: Understand; Advanced: none) — voice never waits on the coach.
+Mic audio is resampled to PCM and sent over a WebSocket bridge to Gemini Live. Audio and transcripts return the same way. Browser Korean ASR is merged with Live transcription for snappier captions. Coaching is a second Gemini model, called only on Understand / Polish — voice never waits on the coach.
+
+Coaching by level: Beginner (Understand + Polish) · Intermediate (Understand) · Advanced (none).
